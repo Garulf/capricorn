@@ -270,6 +270,18 @@ async fn waybar_status_reports_recording() {
 }
 
 #[tokio::test]
+async fn waybar_status_reports_recording_while_the_vault_is_locked() {
+    let env = Env::new();
+    env.start_daemon(|_| status(VaultState::Locked));
+
+    let out = env.run(&["status", "--waybar"], "").await;
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json["class"], "recording");
+    assert_eq!(json["tooltip"], "recording, vault locked");
+}
+
+#[tokio::test]
 async fn plain_status_exits_3_when_daemon_is_down() {
     let env = Env::new();
     let out = env.run(&["status"], "").await;
