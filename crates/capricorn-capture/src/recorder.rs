@@ -14,7 +14,7 @@ use crate::clipboard::{self, ClipText};
 use crate::config::{self, Settings};
 use crate::context::{focused_context, fullscreen_paused, is_terminal, window_context};
 use crate::cwd::foreground_cwd;
-use crate::exclude::{Coverage, Snapshot, blackout, is_excluded, stable};
+use crate::exclude::{Coverage, ExclusionMemory, Snapshot, blackout, focus_is_excluded, stable};
 use crate::idle;
 use crate::link::{DaemonLink, LinkEvent};
 use crate::scheduler::{Decision, Input, Scheduler};
@@ -30,7 +30,7 @@ pub fn now_ms() -> Ts {
 }
 
 struct Channels {
-    idle: UnboundedReceiver<Input>,
+    inputs: UnboundedReceiver<Input>,
     clip: UnboundedReceiver<ClipText>,
     hypr: UnboundedReceiver<HyprEvent>,
     link: UnboundedReceiver<LinkEvent>,
@@ -44,7 +44,7 @@ pub async fn run() -> anyhow::Result<()> {
     let conn = wl::connect()?;
 
     let (died_tx, died) = mpsc::unbounded_channel();
-    let (idle_tx, idle) = mpsc::unbounded_channel();
+    let (input_tx, inputs) = mpsc::unbounded_channel();
     let (clip_tx, clip) = mpsc::unbounded_channel();
     let (hypr_tx, hypr_events) = mpsc::unbounded_channel();
     let (link_tx, link) = mpsc::unbounded_channel();
@@ -52,7 +52,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (settle, idle_after) = (settings.settle, settings.idle);
     let idle_conn = conn.clone();
     spawn_watcher("idle", died_tx.clone(), move || {
-        idle::watch(&idle_conn, settle, idle_after, idle_tx)
+        idle::watch(&idle_conn, settle, idle_after, input_tx)
     });
     let clip_conn = conn.clone();
     spawn_watcher("clipboard", died_tx.clone(), move || {
@@ -67,11 +67,12 @@ pub async fn run() -> anyhow::Result<()> {
         conn,
         settings,
         reported: None,
+        exclusions: ExclusionMemory::default(),
     };
     info!("recording started");
     recorder
         .event_loop(Channels {
-            idle,
+            inputs,
             clip,
             hypr: hypr_events,
             link,
@@ -121,6 +122,7 @@ struct Recorder {
     conn: Connection,
     settings: Settings,
     reported: Option<RecorderState>,
+    exclusions: ExclusionMemory,
 }
 
 impl Recorder {
@@ -131,7 +133,7 @@ impl Recorder {
         loop {
             tokio::select! {
                 _ = ticks.tick() => self.on_input(Input::Tick).await,
-                Some(input) = ch.idle.recv() => self.on_input(input).await,
+                Some(input) = ch.inputs.recv() => self.on_input(input).await,
                 Some(event) = ch.hypr.recv() => self.on_hypr(event).await,
                 Some(clip) = ch.clip.recv() => self.on_clip(clip).await,
                 Some(event) = ch.link.recv() => self.on_link(event).await,
@@ -151,13 +153,17 @@ impl Recorder {
         }
     }
 
+    /// Every event but a title change may start an animation, including ones not parsed
+    /// further such as `activespecial` or `changefloatingmode`.
     async fn on_hypr(&mut self, event: HyprEvent) {
         match event {
-            HyprEvent::Other => return,
-            HyprEvent::WindowTitle => {}
-            _ => self.refresh_fullscreen().await,
+            HyprEvent::Versioned => {}
+            HyprEvent::WindowTitle => self.on_input(Input::TitleChanged).await,
+            _ => {
+                self.refresh_fullscreen().await;
+                self.on_input(Input::HyprEvent).await;
+            }
         }
-        self.on_input(Input::HyprEvent).await;
     }
 
     async fn on_link(&mut self, event: LinkEvent) {
@@ -189,27 +195,40 @@ impl Recorder {
         self.reported = self.link.send(CaptureMsg::Recorder(state)).then_some(state);
     }
 
-    async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+    /// Every snapshot also feeds the memory of excluded windows.
+    async fn snapshot(&mut self) -> anyhow::Result<Snapshot> {
         let (clients, monitors, active) = tokio::try_join!(
             self.hypr.clients(),
             self.hypr.monitors(),
             self.hypr.active_window()
         )?;
-        Ok(Snapshot {
+        let snap = Snapshot {
             clients,
             monitors,
             active,
-        })
+        };
+        self.exclusions
+            .observe(&snap, &self.settings.rules, Instant::now());
+        Ok(snap)
     }
 
     /// Grabs every output between two Hyprland reads and drops the whole set when anything
-    /// that decides exclusions moved in between.
+    /// that decides exclusions moved in between, while an excluded window has focus, or
+    /// while one may still be animating out of view.
     async fn capture_outputs(&mut self) -> anyhow::Result<()> {
         let before = self.snapshot().await?;
+        if let Some(reason) = self.unsafe_to_capture(&before) {
+            debug!("capture skipped: {reason}");
+            return Ok(());
+        }
         let grabs = self.grab(&before.monitors).await?;
         let after = self.snapshot().await?;
         if !stable(&before, &after, &self.settings.rules) {
             debug!("frame dropped: windows moved during capture");
+            return Ok(());
+        }
+        if let Some(reason) = self.unsafe_to_capture(&after) {
+            debug!("frame dropped: {reason}");
             return Ok(());
         }
         let visible = after.visible_clients();
@@ -226,6 +245,16 @@ impl Recorder {
             }
         }
         Ok(())
+    }
+
+    fn unsafe_to_capture(&self, snap: &Snapshot) -> Option<&'static str> {
+        if focus_is_excluded(snap, &self.settings.rules) {
+            Some("an excluded window has focus")
+        } else if self.exclusions.unsettled(Instant::now()) {
+            Some("an excluded window was just hidden or moved")
+        } else {
+            None
+        }
     }
 
     async fn grab(&self, monitors: &[Monitor]) -> anyhow::Result<Vec<anyhow::Result<RgbaImage>>> {
@@ -269,11 +298,7 @@ impl Recorder {
                 return;
             }
         };
-        if snap
-            .active
-            .as_ref()
-            .is_some_and(|c| is_excluded(c, &self.settings.rules))
-        {
+        if focus_is_excluded(&snap, &self.settings.rules) {
             return;
         }
         let entry = ClipboardEntry {
