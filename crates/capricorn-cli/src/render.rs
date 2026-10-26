@@ -207,6 +207,7 @@ mod tests {
             vault: VaultState::Unlocked { locks_in_secs: 90 },
             recorder: Some(RecorderState::Paused),
             pending_index: 3,
+            session: false,
         };
         assert_eq!(
             status_text(&status),

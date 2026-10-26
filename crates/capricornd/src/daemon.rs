@@ -149,11 +149,16 @@ impl Daemon {
         &self.cfg
     }
 
-    pub fn status(&self) -> Status {
+    pub fn status(&self, conn: ConnId) -> Status {
+        let (vault, session) = {
+            let state = lock(&self.state);
+            (state.describe(Instant::now()), state.has_session(conn))
+        };
         Status {
-            vault: lock(&self.state).describe(Instant::now()),
+            vault,
             recorder: lock(&self.recorders).last().and_then(|(_, state)| *state),
             pending_index: self.pending_index.load(Ordering::Relaxed),
+            session,
         }
     }
 

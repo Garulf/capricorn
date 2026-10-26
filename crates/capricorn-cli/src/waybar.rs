@@ -59,6 +59,7 @@ mod tests {
             vault,
             recorder,
             pending_index: 0,
+            session: false,
         }
     }
 

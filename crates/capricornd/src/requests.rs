@@ -51,7 +51,7 @@ impl Daemon {
 
     fn dispatch(&self, conn: ConnId, req: ClientReq) -> Result<ClientResp, DaemonError> {
         let resp = match req {
-            ClientReq::Status => ClientResp::Status(self.status()),
+            ClientReq::Status => ClientResp::Status(self.status(conn)),
             ClientReq::Init { password, recovery } => {
                 match self.init(password.expose(), recovery)? {
                     Some(code) => ClientResp::RecoveryCode(Secret::new(code)),

@@ -576,6 +576,29 @@ async fn other_connection_cannot_search_after_unlock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reports_whether_this_connection_holds_a_session() {
+    let root = TempDir::new().unwrap();
+    let ocr = Arc::new(FakeOcr::default());
+    let (daemon, mut ui) = initialized(test_config(root.path()), &ocr).await;
+    let mut cli = daemon.client().await;
+    assert!(!ui.status().await.session);
+
+    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
+    assert!(ui.status().await.session);
+    let other = cli.status().await;
+    assert!(matches!(other.vault, VaultState::Unlocked { .. }));
+    assert!(!other.session);
+
+    assert_eq!(cli.call(ClientReq::Lock).await, ClientResp::Ok);
+    assert_eq!(cli.unlock(PASSWORD).await, ClientResp::Ok);
+    let after = ui.status().await;
+    assert!(matches!(after.vault, VaultState::Unlocked { .. }));
+    assert!(!after.session, "a lock in between ended the UI's session");
+    assert!(cli.status().await.session);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_password_delays_and_errors() {
     let root = TempDir::new().unwrap();
     let ocr = Arc::new(FakeOcr::default());

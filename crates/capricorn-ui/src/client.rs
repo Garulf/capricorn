@@ -102,6 +102,7 @@ mod tests {
             vault: VaultState::Locked,
             recorder: None,
             pending_index: 0,
+            session: false,
         })
     }
 

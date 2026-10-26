@@ -93,6 +93,7 @@ fn status(vault: VaultState) -> ClientResp {
         vault,
         recorder: Some(RecorderState::Recording),
         pending_index: 0,
+        session: false,
     })
 }
 
