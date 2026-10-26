@@ -115,7 +115,14 @@ processes they didn't start.
   separate windows, so they can't be excluded by window rules. On-screen secret redaction
   catches some of what they show, not all.
 - On rotated monitors, a frame that would need an excluded window blacked out is dropped
-  entirely.
+  entirely. The same happens on every monitor while an excluded window has focus (its
+  menus and popups are not separate windows) and for two seconds after an excluded
+  window closes, moves or leaves the screen.
+- Capture waits until Hyprland has been quiet for `settleMs` (at least one second) so
+  that windows are not caught mid-animation. If your animations are slower than that,
+  raise `programs.capricorn.capture.settleMs`.
+- Recording pauses while the screen is locked. This is detected from a running
+  hyprlock, swaylock, gtklock or waylock process, or from logind's locked hint.
 - Small leftovers of short-lived keys may remain in freed heap memory inside the
   encryption library until it is reused. The same goes for the decrypted search index
   and records after locking: the daemon drops them but does not overwrite every byte.

@@ -158,7 +158,7 @@ in
       settleMs = lib.mkOption {
         type = lib.types.ints.positive;
         default = 1500;
-        description = "Capture after this long without input.";
+        description = "Capture after this long without input or window changes (never less than 1 s). Raise it if your Hyprland animations take longer, so excluded windows are never caught mid-animation.";
       };
       idleSecs = lib.mkOption {
         type = lib.types.ints.positive;
