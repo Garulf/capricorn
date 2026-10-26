@@ -1,0 +1,116 @@
+use std::io;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KdfOverride {
+    pub memory_kib: u32,
+    pub iterations: u32,
+    pub parallelism: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+pub struct Config {
+    pub lock_timeout_secs: u64,
+    pub retention_days: Option<u32>,
+    pub retention_max_gib: Option<u64>,
+    pub clipboard_retention_days: Option<u32>,
+    pub forget_grace_mins: u32,
+    pub allowed_uids: Vec<u32>,
+    pub capture_clients: Vec<PathBuf>,
+    pub ui_clients: Vec<PathBuf>,
+    pub secret_patterns: Vec<String>,
+    pub kdf: Option<KdfOverride>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            lock_timeout_secs: 15 * 60,
+            retention_days: Some(90),
+            retention_max_gib: Some(50),
+            clipboard_retention_days: None,
+            forget_grace_mins: 15,
+            allowed_uids: Vec::new(),
+            capture_clients: Vec::new(),
+            ui_clients: Vec::new(),
+            secret_patterns: Vec::new(),
+            kdf: None,
+        }
+    }
+}
+
+impl Config {
+    /// Compiles `secret_patterns`, failing on the first invalid regex.
+    pub fn compiled_secret_patterns(&self) -> anyhow::Result<Vec<Regex>> {
+        self.secret_patterns
+            .iter()
+            .map(|p| Regex::new(p).with_context(|| format!("invalid secret pattern `{p}`")))
+            .collect()
+    }
+}
+
+/// A missing file yields `Config::default()`; any other read or parse failure is an error.
+pub fn load(path: &Path) -> anyhow::Result<Config> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Config::default()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(cfg.lock_timeout_secs, 900);
+        assert_eq!(cfg.retention_days, Some(90));
+        assert_eq!(cfg.retention_max_gib, Some(50));
+        assert_eq!(cfg.forget_grace_mins, 15);
+        assert!(cfg.kdf.is_none());
+    }
+
+    #[test]
+    fn config_partial_override_keeps_other_defaults() {
+        let cfg: Config = toml::from_str(
+            "lock_timeout_secs = 60\nretention_days = 30\n[kdf]\nmemory_kib = 8\niterations = 1\nparallelism = 1\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.lock_timeout_secs, 60);
+        assert_eq!(cfg.retention_days, Some(30));
+        assert_eq!(cfg.retention_max_gib, Some(50));
+        assert_eq!(cfg.kdf.unwrap().memory_kib, 8);
+    }
+
+    #[test]
+    fn config_missing_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = load(&dir.path().join("nope.toml")).unwrap();
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn config_invalid_file_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "lock_timeout_secs = \"soon\"").unwrap();
+        assert!(load(&path).is_err());
+    }
+
+    #[test]
+    fn invalid_secret_pattern_is_error() {
+        let cfg = Config {
+            secret_patterns: vec!["(".into()],
+            ..Config::default()
+        };
+        assert!(cfg.compiled_secret_patterns().is_err());
+    }
+}
