@@ -1,14 +1,15 @@
 //! Daemon state and the operations on it. Every method here may block on disk or CPU
 //! work, so async callers go through `spawn_blocking`.
 //!
-//! Lock order, outermost first: `unlock_gate`, `ingest_gate`, `store`, `state`.
-//! `recorder` and `forgotten` are leaf locks.
+//! Lock order, outermost first: `unlock_gate`, `ingest_gate`, `store`, `state`,
+//! `snapshot_gate`. `recorders`, `forgotten` and `failures` are leaf locks. Locking the
+//! vault never takes `unlock_gate`, so a slow or flooded unlock cannot delay it.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -46,6 +47,12 @@ pub enum DaemonError {
     Indexing,
     #[error("not found")]
     NotFound,
+    #[error("busy, try again")]
+    Busy,
+    #[error("too many attempts, try again later")]
+    TooManyAttempts,
+    #[error("locked during unlock, try again")]
+    LockedDuringUnlock,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -76,7 +83,13 @@ pub struct Daemon {
     store: Mutex<Option<SegmentStore>>,
     unlock_gate: Mutex<()>,
     ingest_gate: Mutex<()>,
-    recorder: Mutex<Option<RecorderState>>,
+    snapshot_gate: Mutex<()>,
+    has_store: AtomicBool,
+    /// Capture connections in the order they connected, with what each reported.
+    recorders: Mutex<Vec<(u64, Option<RecorderState>)>>,
+    failures: Mutex<FailedAttempts>,
+    /// Bumped by every lock, so an unlock that raced a lock does not install itself.
+    lock_epoch: AtomicU64,
     /// Captures stamped inside this window were forgotten while still queued.
     forgotten: Mutex<Option<(Ts, Ts)>>,
     pending_index: AtomicU64,
@@ -115,10 +128,14 @@ impl Daemon {
             data_dir,
             cfg,
             state: Mutex::new(state),
+            has_store: AtomicBool::new(store.is_some()),
             store: Mutex::new(store),
             unlock_gate: Mutex::new(()),
             ingest_gate: Mutex::new(()),
-            recorder: Mutex::new(None),
+            snapshot_gate: Mutex::new(()),
+            recorders: Mutex::new(Vec::new()),
+            failures: Mutex::new(FailedAttempts::default()),
+            lock_epoch: AtomicU64::new(0),
             forgotten: Mutex::new(None),
             pending_index: AtomicU64::new(0),
             paused: AtomicBool::new(false),
@@ -135,7 +152,7 @@ impl Daemon {
     pub fn status(&self) -> Status {
         Status {
             vault: lock(&self.state).describe(Instant::now()),
-            recorder: *lock(&self.recorder),
+            recorder: lock(&self.recorders).last().and_then(|(_, state)| *state),
             pending_index: self.pending_index.load(Ordering::Relaxed),
         }
     }
@@ -149,6 +166,7 @@ impl Daemon {
             Vault::create(&self.data_dir, password, self.kdf_params(), recovery)?;
         let store = SegmentStore::open(&self.data_dir.join(SEGMENTS_DIR), vault.recipient())?;
         *lock(&self.store) = Some(store);
+        self.has_store.store(true, Ordering::Relaxed);
         *lock(&self.state) = VaultState::Locked {
             vault: Arc::new(vault),
         };
@@ -156,44 +174,90 @@ impl Daemon {
         Ok(code.map(|mut code| std::mem::take(&mut *code)))
     }
 
-    /// Grants `conn` a session, unlocking the vault first if needed.
+    /// Grants `conn` a session, unlocking the vault first if needed. One attempt runs at
+    /// a time; others are turned away rather than queued, and repeated failures make
+    /// every caller wait (see [`FailedAttempts`]).
     pub fn unlock(&self, conn: ConnId, credential: Credential<'_>) -> Result<(), DaemonError> {
-        let _gate = lock(&self.unlock_gate);
+        let _gate = match self.unlock_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return Err(DaemonError::Busy),
+        };
+        lock(&self.failures).check(Instant::now())?;
+        let epoch = self.lock_epoch.load(Ordering::SeqCst);
         let vault = lock(&self.state)
             .vault()
             .cloned()
             .ok_or(DaemonError::NotInitialized)?;
-        let id = match credential {
-            Credential::Password(password) => vault.unlock(password)?,
-            Credential::RecoveryCode(code) => vault.unlock_recovery(code)?,
-        };
+        let id = self.check_credential(&vault, credential)?;
         if let Some(unlocked) = lock(&self.state).unlocked_mut() {
             unlocked.sessions.insert(conn);
             unlocked.extend(self.lock_timeout());
             return Ok(());
         }
         let unlocked = self.open_session(vault, id, conn)?;
-        *lock(&self.state) = VaultState::Unlocked(Box::new(unlocked));
+        let mut state = lock(&self.state);
+        if self.lock_epoch.load(Ordering::SeqCst) != epoch {
+            return Err(DaemonError::LockedDuringUnlock);
+        }
+        *state = VaultState::Unlocked(Box::new(unlocked));
+        drop(state);
         self.pending_index.store(1, Ordering::Relaxed);
         self.catch_up_wanted.notify_one();
         info!("vault unlocked");
         Ok(())
     }
 
-    /// Writes a final snapshot, then forgets the private key and the index.
+    /// Counts a wrong password or recovery code toward the shared backoff.
+    fn check_credential(
+        &self,
+        vault: &Vault,
+        credential: Credential<'_>,
+    ) -> Result<Identity, DaemonError> {
+        let checked = match credential {
+            Credential::Password(password) => vault.unlock(password),
+            Credential::RecoveryCode(code) => vault.unlock_recovery(code),
+        };
+        let mut failures = lock(&self.failures);
+        match checked {
+            Ok(id) => {
+                failures.reset();
+                Ok(id)
+            }
+            Err(VaultError::BadPassword) => {
+                failures.record(Instant::now());
+                Err(DaemonError::BadPassword)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Forgets the private key at once, then writes the final snapshot, which needs only
+    /// the index key. Never waits for an unlock in progress; that unlock sees the new
+    /// lock epoch and backs out.
     pub fn lock_vault(&self, reason: &str) {
-        let _gate = lock(&self.unlock_gate);
-        let Some(mut unlocked) = lock(&self.state).take_unlocked() else {
+        self.lock_epoch.fetch_add(1, Ordering::SeqCst);
+        let mut state = lock(&self.state);
+        let Some(unlocked) = state.take_unlocked() else {
             return;
         };
+        let _snapshot = lock(&self.snapshot_gate);
+        drop(state);
         self.pending_index.store(0, Ordering::Relaxed);
-        if let Err(error) = self.save_snapshot(&mut unlocked) {
+        let Unlocked {
+            id,
+            mut index,
+            watermark,
+            index_key,
+            ..
+        } = *unlocked;
+        drop(id);
+        if let Err(error) = self.index_files.save(&index_key, &mut index, &watermark) {
             warn!(
                 error = format!("{error:#}"),
                 "could not write index snapshot"
             );
         }
-        drop(unlocked);
         info!(reason, "vault locked");
     }
 
@@ -209,9 +273,10 @@ impl Daemon {
 
     pub fn change_password(&self, conn: ConnId, old: &str, new: &str) -> Result<(), DaemonError> {
         let _gate = lock(&self.unlock_gate);
-        let id = self.with_session(conn, |unlocked| Ok(unlocked.id.clone()))?;
+        self.with_session(conn, |_| Ok(()))?;
         let mut vault = Vault::open(&self.data_dir)?;
         vault.unlock(old)?;
+        let id = self.with_session(conn, |unlocked| Ok(unlocked.id.clone()))?;
         vault.change_password(&id, new, self.kdf_params())?;
         if let Some(unlocked) = lock(&self.state).unlocked_mut() {
             unlocked.vault = Arc::new(vault);
@@ -244,9 +309,12 @@ impl Daemon {
         op(unlocked)
     }
 
+    /// Holds the store lock from the session check to the read, so a lock in between
+    /// cannot leave this decrypting afterwards.
     pub fn image(&self, conn: ConnId, r: RecordRef, thumb: bool) -> Result<Vec<u8>, DaemonError> {
+        let store_guard = lock(&self.store);
         let id = self.with_session(conn, |unlocked| Ok(unlocked.id.clone()))?;
-        let record = lock(&self.store)
+        let record = store_guard
             .as_ref()
             .ok_or(DaemonError::NotFound)?
             .read(r, Some(&id))?;
@@ -275,13 +343,16 @@ impl Daemon {
         };
         let id = unlocked.id.clone();
         delete_refs(store, &refs, &id)?;
+        self.save_snapshot(unlocked)?;
         info!(records = refs.len(), "deleted captures");
         Ok(())
     }
 
     /// Drops captures from the last `minutes` (capped at the seal grace period), which
-    /// works while locked because those captures are still in open hours.
-    pub fn forget(&self, minutes: u32) -> Result<u32> {
+    /// works while locked because those captures are still in open hours. When unlocked,
+    /// exactly the removed refs leave the index and the snapshot is rewritten; when
+    /// locked, the next catch-up pass drops them.
+    pub fn forget(&self, minutes: u32) -> Result<usize> {
         let minutes = minutes.min(self.cfg.forget_grace_mins);
         if minutes == 0 {
             return Ok(0);
@@ -295,10 +366,11 @@ impl Daemon {
         };
         let removed = store.forget_since(since)?;
         if let Some(unlocked) = lock(&self.state).unlocked_mut() {
-            unlocked.index.delete_range(since, Ts::MAX)?;
+            unlocked.index.delete_refs(&removed)?;
+            self.save_snapshot(unlocked)?;
         }
-        info!(minutes, removed, "forgot recent captures");
-        Ok(removed)
+        info!(minutes, removed = removed.len(), "forgot recent captures");
+        Ok(removed.len())
     }
 
     /// Seals a processed capture into its hour and, when the index is caught up,
@@ -334,11 +406,25 @@ impl Daemon {
     }
 
     pub fn accepts_captures(&self) -> bool {
-        !self.paused.load(Ordering::Relaxed) && lock(&self.store).is_some()
+        !self.paused.load(Ordering::Relaxed) && self.has_store.load(Ordering::Relaxed)
     }
 
-    pub fn set_recorder(&self, recorder: Option<RecorderState>) {
-        *lock(&self.recorder) = recorder;
+    pub fn capture_connected(&self, capture: u64) {
+        lock(&self.recorders).push((capture, None));
+    }
+
+    pub fn capture_disconnected(&self, capture: u64) {
+        lock(&self.recorders).retain(|(id, _)| *id != capture);
+    }
+
+    /// Status shows the newest live capture connection, so a stale one cannot override it.
+    pub fn set_recorder(&self, capture: u64, recorder: RecorderState) {
+        if let Some(entry) = lock(&self.recorders)
+            .iter_mut()
+            .find(|(id, _)| *id == capture)
+        {
+            entry.1 = Some(recorder);
+        }
     }
 
     pub fn set_paused(&self, paused: bool) {
@@ -429,7 +515,9 @@ impl Daemon {
         }
     }
 
+    /// Callers hold `state`, so snapshots land in the order of the states they capture.
     fn save_snapshot(&self, unlocked: &mut Unlocked) -> Result<()> {
+        let _snapshot = lock(&self.snapshot_gate);
         self.index_files.save(
             &unlocked.index_key,
             &mut unlocked.index,
@@ -473,6 +561,7 @@ impl Daemon {
     /// An unreadable key or snapshot is replaced by an empty index rebuilt from the
     /// segments, which hold everything the index did.
     fn load_index(&self, id: &Identity) -> Result<(IndexKey, Index, Watermark)> {
+        let _snapshot = lock(&self.snapshot_gate);
         let loaded = self.index_files.load_or_create_key(id).and_then(|key| {
             let snapshot = self.index_files.load(&key)?;
             Ok((key, snapshot))
@@ -580,10 +669,76 @@ fn delete_refs(store: &mut SegmentStore, refs: &[RecordRef], id: &Identity) -> R
     Ok(())
 }
 
+/// Shared by every connection, so opening more connections buys no more guesses.
+#[derive(Default)]
+struct FailedAttempts {
+    consecutive: u32,
+    last: Option<Instant>,
+}
+
+impl FailedAttempts {
+    /// Failures allowed before attempts are spaced out.
+    const FREE: u32 = 3;
+    const MAX_WAIT: Duration = Duration::from_secs(60);
+
+    fn record(&mut self, at: Instant) {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.last = Some(at);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// After `FREE` failures in a row the next attempt waits 1 s from the last failure,
+    /// doubling with each further failure up to a minute.
+    fn wait(&self) -> Duration {
+        let Some(extra) = self.consecutive.checked_sub(Self::FREE + 1) else {
+            return Duration::ZERO;
+        };
+        Duration::from_secs(1u64 << extra.min(6)).min(Self::MAX_WAIT)
+    }
+
+    fn check(&self, now: Instant) -> Result<(), DaemonError> {
+        match self.last {
+            Some(last) if now < last + self.wait() => Err(DaemonError::TooManyAttempts),
+            _ => Ok(()),
+        }
+    }
+}
+
 fn create_private_dir(dir: &Path) -> Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("creating {}", dir.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_attempts_back_off_after_the_free_ones() {
+        let start = Instant::now();
+        let mut failures = FailedAttempts::default();
+        for _ in 0..FailedAttempts::FREE {
+            assert!(failures.check(start).is_ok());
+            failures.record(start);
+        }
+        assert!(failures.check(start).is_ok());
+        failures.record(start);
+        assert!(failures.check(start + Duration::from_millis(500)).is_err());
+        assert!(failures.check(start + Duration::from_secs(1)).is_ok());
+        failures.record(start);
+        assert!(failures.check(start + Duration::from_secs(1)).is_err());
+        assert!(failures.check(start + Duration::from_secs(2)).is_ok());
+        for _ in 0..20 {
+            failures.record(start);
+        }
+        assert_eq!(failures.wait(), FailedAttempts::MAX_WAIT);
+        failures.reset();
+        assert!(failures.check(start).is_ok());
+    }
 }

@@ -15,7 +15,7 @@ use capricorn_core::proto::{
     CaptureCtl, CaptureMsg, ClientReq, ClientResp, ClipboardEntry, DeleteScope, Frame, Hit, Kind,
     RecordRef, RecorderState, Rect, SearchQuery, Status, VaultState, WindowContext,
 };
-use capricornd::logind::{LockCause, LockSignals};
+use capricornd::logind::{LockCause, LockRequest, LockSignals};
 use capricornd::ocr::{Ocr, Word};
 use image::RgbImage;
 use tempfile::TempDir;
@@ -93,6 +93,7 @@ fn test_config(root: &Path) -> Config {
     Config {
         data_dir: Some(root.join("data")),
         runtime_dir: Some(root.join("run")),
+        allow_any_uid: true,
         kdf: Some(KdfOverride {
             memory_kib: 8,
             iterations: 1,
@@ -276,13 +277,17 @@ impl Capture {
 
     /// Paced below the per-connection frame rate limit.
     async fn frame(&mut self, class: &str, text: &str) {
+        self.frame_at(class, text, now_ms()).await;
+    }
+
+    async fn frame_at(&mut self, class: &str, text: &str, ts: i64) {
         let color = color_for(text);
         self.ocr.teach(color, text);
         let output = format!("OUT-{text}");
         let (width, height) = (64u32, 36u32);
         let rgba = [color[0], color[1], color[2], 255].repeat((width * height) as usize);
         self.send(CaptureMsg::Frame(Frame {
-            ts: now_ms(),
+            ts,
             output: output.clone(),
             width,
             height,
@@ -616,9 +621,21 @@ async fn wrong_password_delays_and_errors() {
         })
         .await;
     assert_eq!(bad_code, ClientResp::Err("bad password".into()));
+    assert_eq!(
+        client.unlock("nope").await,
+        ClientResp::Err("bad password".into())
+    );
     assert_eq!(client.status().await.vault, VaultState::Locked);
 
-    assert_eq!(client.unlock(unicode).await, ClientResp::Ok);
+    let too_many = ClientResp::Err("too many attempts, try again later".into());
+    let started = Instant::now();
+    assert_eq!(fresh.unlock(unicode).await, too_many);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "refusals are not delayed"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(fresh.unlock(unicode).await, ClientResp::Ok);
     daemon.stop().await;
 }
 
@@ -754,6 +771,19 @@ async fn garbage_client_does_not_kill_daemon() {
         }
     }
 
+    let mut oversized = (100u32 * 1024).to_be_bytes().to_vec();
+    oversized.extend([0u8; 1024]);
+    let mut rogue = connect(&client_socket).await;
+    rogue.write_all(&oversized).await.unwrap();
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(WAIT_LIMIT, rogue.read(&mut buf))
+        .await
+        .expect("daemon waited for an oversized client frame");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "daemon answered an oversized frame"
+    );
+
     let mut client = daemon.client().await;
     assert_eq!(client.status().await.vault, VaultState::Uninitialized);
     daemon.stop().await;
@@ -794,13 +824,21 @@ async fn snapshot_survives_restart() {
     daemon.stop().await;
 }
 
-struct ChannelSignals(mpsc::Receiver<LockCause>);
+/// Forwards each cause and reports when the daemon said the lock was done.
+struct ChannelSignals {
+    causes: mpsc::Receiver<LockCause>,
+    done: mpsc::Sender<LockCause>,
+}
 
 impl LockSignals for ChannelSignals {
-    async fn watch(mut self, tx: mpsc::Sender<LockCause>) {
-        while let Some(cause) = self.0.recv().await {
-            if tx.send(cause).await.is_err() {
+    async fn watch(mut self, tx: mpsc::Sender<LockRequest>) {
+        while let Some(cause) = self.causes.recv().await {
+            let (request, locked) = LockRequest::new(cause);
+            if tx.send(request).await.is_err() {
                 break;
+            }
+            if locked.await.is_ok() {
+                let _ = self.done.send(cause).await;
             }
         }
     }
@@ -810,27 +848,31 @@ impl LockSignals for ChannelSignals {
 async fn sleep_signal_locks() {
     let root = TempDir::new().unwrap();
     let ocr = Arc::new(FakeOcr::default());
-    let (signal, signals) = mpsc::channel(4);
+    let (signal, causes) = mpsc::channel(4);
+    let (done, mut locked) = mpsc::channel(4);
     let daemon = start_with(test_config(root.path()), &ocr, move |cfg, ocr, stop| {
         tokio::spawn(capricornd::run_with_lock_signals(
             cfg,
             ocr,
-            ChannelSignals(signals),
+            ChannelSignals { causes, done },
             stop,
         ))
     })
     .await;
     let mut ui = daemon.client().await;
     ui.init(PASSWORD).await;
-    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
-    signal.send(LockCause::Sleep).await.unwrap();
-    ui.wait_for_vault(|vault| *vault == VaultState::Locked)
-        .await;
-
-    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
-    signal.send(LockCause::ScreenLock).await.unwrap();
-    ui.wait_for_vault(|vault| *vault == VaultState::Locked)
-        .await;
+    for cause in [LockCause::Sleep, LockCause::ScreenLock] {
+        assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
+        signal.send(cause).await.unwrap();
+        let reported = tokio::time::timeout(WAIT_LIMIT, locked.recv()).await;
+        assert_eq!(reported.unwrap(), Some(cause));
+        assert_eq!(
+            ui.status().await.vault,
+            VaultState::Locked,
+            "done came before the lock"
+        );
+        assert!(root.path().join("data/index.snap").exists());
+    }
     daemon.stop().await;
 }
 
@@ -853,7 +895,162 @@ async fn pause_reaches_capture_client() {
     let ctl: CaptureCtl = read_msg(&mut capture.stream).await.unwrap();
     assert_eq!(ctl, CaptureCtl::Resume);
 
+    let mut newer = daemon.capture(&ocr).await;
+    newer
+        .send(CaptureMsg::Recorder(RecorderState::Paused))
+        .await;
+    ui.wait_for_status(|status| status.recorder == Some(RecorderState::Paused))
+        .await;
+    capture
+        .send(CaptureMsg::Recorder(RecorderState::Idle))
+        .await;
     drop(capture);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        ui.status().await.recorder,
+        Some(RecorderState::Paused),
+        "an older connection does not override the newest one"
+    );
+    drop(newer);
     ui.wait_for_status(|status| status.recorder.is_none()).await;
     daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgotten_captures_stay_gone_after_restart() {
+    let root = TempDir::new().unwrap();
+    let ocr = Arc::new(FakeOcr::default());
+    let cfg = test_config(root.path());
+    let (daemon, mut ui) = initialized(cfg.clone(), &ocr).await;
+    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
+    let mut capture = daemon.capture(&ocr).await;
+    capture.frame("kitty", "regrettable tangerine").await;
+    ui.wait_for_hits("tangerine", 1).await;
+    assert_eq!(ui.call(ClientReq::Lock).await, ClientResp::Ok);
+    drop(capture);
+    drop(ui);
+    daemon.stop().await;
+
+    let daemon = start(cfg, &ocr).await;
+    let mut ui = daemon.client().await;
+    assert_eq!(
+        ui.call(ClientReq::Forget { minutes: 5 }).await,
+        ClientResp::Ok
+    );
+    let mut capture = daemon.capture(&ocr).await;
+    let calls = ocr.calls.load(Ordering::SeqCst);
+    capture.frame("kitty", "harmless cucumber").await;
+    wait_until_stored(&root.path().join("data"), &ocr, calls + 1).await;
+
+    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
+    ui.wait_until_indexed().await;
+    assert!(ui.hits("tangerine").await.is_empty());
+    let hits = ui.hits("cucumber").await;
+    assert_eq!(hits.len(), 1);
+    match ui.call(ClientReq::Detail(hits[0].r)).await {
+        ClientResp::Detail(detail) => assert!(detail.text.contains("cucumber")),
+        other => panic!("expected detail, got {other:?}"),
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forget_removes_captures_with_old_timestamps() {
+    let root = TempDir::new().unwrap();
+    let ocr = Arc::new(FakeOcr::default());
+    let (daemon, mut ui) = initialized(test_config(root.path()), &ocr).await;
+    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
+    ui.wait_until_indexed().await;
+    let mut capture = daemon.capture(&ocr).await;
+    capture
+        .frame_at("kitty", "backdated pomegranate", now_ms() - 30 * 60_000)
+        .await;
+    ui.wait_for_hits("pomegranate", 1).await;
+    capture.send(CaptureMsg::Forget { minutes: 5 }).await;
+    ui.wait_for_hits("pomegranate", 0).await;
+    assert_eq!(ui.call(ClientReq::Lock).await, ClientResp::Ok);
+    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
+    ui.wait_until_indexed().await;
+    assert!(ui.hits("pomegranate").await.is_empty());
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_does_not_wait_for_a_slow_unlock() {
+    let root = TempDir::new().unwrap();
+    let ocr = Arc::new(FakeOcr::default());
+    let cfg = Config {
+        kdf: Some(KdfOverride {
+            memory_kib: 128 * 1024,
+            iterations: 8,
+            parallelism: 1,
+        }),
+        ..test_config(root.path())
+    };
+    let (daemon, _) = initialized(cfg, &ocr).await;
+    let mut slow = daemon.client().await;
+    let unlocking = tokio::spawn(async move { slow.unlock(PASSWORD).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut other = daemon.client().await;
+    assert_eq!(
+        other.unlock(PASSWORD).await,
+        ClientResp::Err("busy, try again".into())
+    );
+    let mut locker = daemon.client().await;
+    assert_eq!(locker.call(ClientReq::Lock).await, ClientResp::Ok);
+    assert!(!unlocking.is_finished(), "lock waited for the unlock");
+    assert_eq!(
+        unlocking.await.unwrap(),
+        ClientResp::Err("locked during unlock, try again".into())
+    );
+    assert_eq!(locker.status().await.vault, VaultState::Locked);
+    assert_eq!(locker.unlock(PASSWORD).await, ClientResp::Ok);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connections_per_socket_are_capped() {
+    let root = TempDir::new().unwrap();
+    let ocr = Arc::new(FakeOcr::default());
+    let daemon = start(test_config(root.path()), &ocr).await;
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        let mut client = daemon.client().await;
+        client.status().await;
+        held.push(client);
+    }
+    let mut refused = connect(&daemon.runtime_dir.join("client.sock")).await;
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(WAIT_LIMIT, refused.read(&mut buf))
+        .await
+        .expect("daemon kept a connection over the cap");
+    assert!(matches!(read, Ok(0) | Err(_)));
+
+    held.pop();
+    eventually("a free connection slot", || {
+        let socket = daemon.runtime_dir.join("client.sock");
+        async move {
+            let mut stream = connect(&socket).await;
+            write_msg(&mut stream, &ClientReq::Status).await.unwrap();
+            read_msg::<_, ClientResp>(&mut stream).await.is_ok()
+        }
+    })
+    .await;
+    drop(held);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn refuses_to_start_without_allowed_uids() {
+    let root = TempDir::new().unwrap();
+    let ocr: Arc<dyn Ocr> = Arc::new(FakeOcr::default());
+    let cfg = Config {
+        allow_any_uid: false,
+        ..test_config(root.path())
+    };
+    let error = capricornd::run_with(cfg, ocr, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("allowed_uids"), "{error:#}");
 }

@@ -1,7 +1,7 @@
 //! Bringing the index up to date with the segments after an unlock, after hours are
 //! sealed, and whenever a capture could not be indexed in order.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -16,9 +16,9 @@ use crate::state::{Unlocked, VaultState};
 
 impl Daemon {
     /// One pass over every hour the index may be missing. Hours sealed and recorded in
-    /// the watermark are skipped; any other hour is decrypted and reconciled, adding
-    /// records the index lacks and dropping ones the segments no longer hold (forgotten
-    /// while locked, for example). Stops early once the vault is locked.
+    /// the watermark are skipped; any other hour is decrypted and its index entries are
+    /// rebuilt from the records, so ones the segments no longer hold (forgotten while
+    /// locked, for example) go. Stops early once the vault is locked.
     pub fn catch_up(&self) -> Result<()> {
         let _gate = self.ingest_gate();
         let result = self.catch_up_pass();
@@ -41,10 +41,10 @@ impl Daemon {
         };
         self.pending_index()
             .store(todo.len() as u64, Ordering::Relaxed);
-        let mut added = 0;
+        let mut reconciled = 0;
         for info in todo {
             match self.ingest_hour(epoch, &id, info) {
-                Ok(Some(count)) => added += count,
+                Ok(Some(())) => reconciled += 1,
                 Ok(None) => return Ok(()),
                 Err(error) => warn!(
                     hour = info.hour,
@@ -54,7 +54,7 @@ impl Daemon {
             }
             self.pending_index().fetch_sub(1, Ordering::Relaxed);
         }
-        self.finish_pass(epoch, added)?;
+        self.finish_pass(epoch, reconciled)?;
         self.apply_clipboard_retention()
     }
 
@@ -79,23 +79,22 @@ impl Daemon {
         ))
     }
 
-    fn ingest_hour(
-        &self,
-        epoch: u64,
-        id: &Arc<Identity>,
-        info: SegmentInfo,
-    ) -> Result<Option<usize>> {
+    fn ingest_hour(&self, epoch: u64, id: &Arc<Identity>, info: SegmentInfo) -> Result<Option<()>> {
         let store_guard = self.store();
         let store = store_guard.as_ref().context("vault has no segment store")?;
+        if current(&mut self.state(), epoch).is_none() {
+            return Ok(None);
+        }
         let records = store.records_in(info.hour, id)?;
+        let next_seq = store.next_seq(info.hour);
         let mut state = self.state();
         let Some(unlocked) = current(&mut state, epoch) else {
             return Ok(None);
         };
-        reconcile_hour(unlocked, info, &records).map(Some)
+        reconcile_hour(unlocked, info, &records, next_seq).map(Some)
     }
 
-    fn finish_pass(&self, epoch: u64, added: usize) -> Result<()> {
+    fn finish_pass(&self, epoch: u64, reconciled: usize) -> Result<()> {
         let mut state = self.state();
         let Some(unlocked) = current(&mut state, epoch) else {
             return Ok(());
@@ -103,8 +102,8 @@ impl Daemon {
         let first_pass = !unlocked.caught_up;
         unlocked.caught_up = true;
         self.pending_index().store(0, Ordering::Relaxed);
-        if first_pass || added > 0 {
-            info!(added, "index caught up");
+        if first_pass || reconciled > 0 {
+            info!(hours = reconciled, "index caught up");
             self.snapshot_after_ingest(unlocked)?;
         }
         Ok(())
@@ -130,24 +129,19 @@ fn prune_missing_hours(unlocked: &mut Unlocked, on_disk: &[SegmentInfo]) -> Resu
     Ok(())
 }
 
+/// Replaces every index entry of the hour with the records the segments hold, so the
+/// index matches them exactly even if a ref was forgotten and its seq reused by an older
+/// build. `next_seq` is the store's counter for a live hour, which can be past the last
+/// record when the newest ones were forgotten.
 fn reconcile_hour(
     unlocked: &mut Unlocked,
     info: SegmentInfo,
     records: &[(RecordRef, Record)],
-) -> Result<usize> {
-    let indexed: HashSet<RecordRef> = unlocked
-        .index
-        .refs_in_hour(info.hour)?
-        .into_iter()
-        .collect();
-    let present: HashSet<RecordRef> = records.iter().map(|(r, _)| *r).collect();
-    for &gone in indexed.difference(&present) {
-        unlocked.index.delete_ref(gone)?;
-    }
-    let mut added = 0;
-    for (r, record) in records.iter().filter(|(r, _)| !indexed.contains(r)) {
+    next_seq: Option<u32>,
+) -> Result<()> {
+    unlocked.index.delete_hour(info.hour)?;
+    for (r, record) in records {
         unlocked.index.add(*r, record)?;
-        added += 1;
     }
     unlocked.index.commit()?;
     let watermark = &mut unlocked.watermark;
@@ -155,8 +149,9 @@ fn reconcile_hour(
         watermark.sealed_hours.insert(info.hour);
         watermark.open_seq.remove(&info.hour);
     } else {
-        let next = records.last().map_or(0, |(r, _)| r.seq.saturating_add(1));
+        let after_last = records.last().map_or(0, |(r, _)| r.seq.saturating_add(1));
+        let next = next_seq.map_or(after_last, |next| next.max(after_last));
         watermark.open_seq.insert(info.hour, next);
     }
-    Ok(added)
+    Ok(())
 }
