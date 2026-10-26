@@ -11,7 +11,7 @@ includes other programs running under your own login.
 | Another program running as you (malicious package, compromised browser) while the vault is locked | Nothing from history. The files belong to a separate system user, and the key that opens them is only in memory while unlocked. |
 | Someone with your disk or a stolen laptop | Ciphertext, plus which hours you were active (see "Metadata" below). |
 | The network | Nothing. The daemon runs with no network access at all (`PrivateNetwork=yes`, AF_UNIX only). |
-| Another user on the machine who is not in `services.capricorn.users` | They can't connect to the daemon's sockets. |
+| Another user on the machine who is not in `services.capricorn.users` | They can't connect to the daemon's sockets, and the daemon rejects their uid if they do. |
 
 ## What is not protected
 
@@ -56,8 +56,13 @@ binary is connecting: it runs as a different uid, so it can't read the client's
 - The private key is wrapped by your password with Argon2id (tuned to roughly half a
   second to a second on your machine) and, optionally, by a recovery code.
 - While unlocked, the private key exists only in the daemon's memory. Locking (timeout,
-  `capricorn lock`, suspend, or a logind lock signal) drops it and the decrypted search
-  index.
+  `capricorn lock`, suspend, or a logind lock signal) drops it first, then saves and drops
+  the decrypted search index. Locking never waits for an unlock attempt in progress.
+- The daemon holds a logind delay inhibitor, so the machine waits for the lock before it
+  suspends. The NixOS module grants this through polkit.
+- Only one unlock attempt runs at a time. After three wrong passwords, further attempts
+  from any connection are refused for a delay that doubles from one second up to a
+  minute, so guessing through many connections at once is no faster than through one.
 
 ### Storage
 
@@ -73,7 +78,7 @@ binary is connecting: it runs as a different uid, so it can't read the client's
   snapshot.
 - Text that looks like a secret (API tokens, private keys, JWTs and your own patterns) is
   never stored from the clipboard, and is blurred in screenshots and redacted from OCR
-  text before anything is encrypted.
+  text, window titles and working directories before anything is encrypted.
 
 ### Metadata
 
@@ -83,6 +88,8 @@ until the next unlock) they can also see the number and size of individual captu
 Segment modification times are reset to the start of the hour, but change times
 (`ctime`) and directory times still show roughly when the last capture was written, and
 the index and key files show when the vault was last locked or its password changed.
+A small per-hour file records how many captures that hour has ever had, including ones
+you later forgot, so that their sequence numbers are never reused.
 
 ## Host requirements
 
