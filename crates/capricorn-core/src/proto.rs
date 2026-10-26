@@ -8,7 +8,7 @@ use crate::secret::Secret;
 /// Unix milliseconds.
 pub type Ts = i64;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct WindowContext {
     pub class: String,
     pub title: String,
@@ -90,8 +90,9 @@ pub enum CaptureCtl {
     Resume,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Kind {
+    #[default]
     Screen,
     Clipboard,
 }
