@@ -107,7 +107,13 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = lib.optionals (!cfg.allowInsecureHost) [
+    assertions = [
+      {
+        assertion = cfg.users != [ ];
+        message = "services.capricorn.users must list at least one user allowed to use the vault.";
+      }
+    ]
+    ++ lib.optionals (!cfg.allowInsecureHost) [
       {
         assertion = swapIsSafe;
         message = "services.capricorn: every swap device must use randomEncryption or live on LUKS (or set services.capricorn.allowInsecureHost).";
