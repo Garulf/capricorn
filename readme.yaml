@@ -1,0 +1,14 @@
+# readwright configuration. All keys are optional; autodetected values are shown.
+# Keys: template, templates, output, strict, allow_exec, screenshots{dir,width,style}, badges,
+#       badges_style, badges_custom, donate, donate_handles, related, project{...}, vars.
+# Run `readwright badges` / `readwright blocks` to list badge presets and template blocks.
+project:
+  name: Capricorn
+  owner: Garulf
+  repo: capricorn
+  license: MIT
+  tagline: >-
+    A private, encrypted screen and clipboard history for Hyprland on NixOS.
+    Find that command, snippet or message you saw last week, without handing your
+    screen to anyone else.
+badges: []
