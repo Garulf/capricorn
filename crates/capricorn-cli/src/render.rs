@@ -1,4 +1,6 @@
 use capricorn_core::proto::{Hit, Kind, RecorderState, Status, VaultState};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde_json::{Value, json};
 
 use crate::waybar::format_duration;
@@ -84,35 +86,19 @@ fn highlight(text: &str, ranges: &[(u32, u32)]) -> String {
     out
 }
 
-/// `YYYY-MM-DD HH:MM UTC` from unix milliseconds.
+/// `YYYY-MM-DD HH:MM TZ` in the system time zone, from unix milliseconds.
 pub fn format_ts(ts_ms: i64) -> String {
-    let secs = ts_ms.div_euclid(1000);
-    let (days, secs_of_day) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
-        secs_of_day / 3600,
-        secs_of_day % 3600 / 60
-    )
+    format_ts_in(ts_ms, &TimeZone::system())
 }
 
-/// Days since 1970-01-01 to proleptic Gregorian date (Howard Hinnant's algorithm).
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let day_of_era = z.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    (year, month, day)
+fn format_ts_in(ts_ms: i64, tz: &TimeZone) -> String {
+    match Timestamp::from_millisecond(ts_ms) {
+        Ok(ts) => ts
+            .to_zoned(tz.clone())
+            .strftime("%Y-%m-%d %H:%M %Z")
+            .to_string(),
+        Err(_) => format!("@{ts_ms}"),
+    }
 }
 
 pub fn status_text(status: &Status) -> String {
@@ -160,11 +146,26 @@ mod tests {
     }
 
     #[test]
-    fn timestamps_format_as_utc() {
-        assert_eq!(format_ts(0), "1970-01-01 00:00 UTC");
-        assert_eq!(format_ts(1_700_000_000_000), "2023-11-14 22:13 UTC");
-        assert_eq!(format_ts(951_782_400_000), "2000-02-29 00:00 UTC");
-        assert_eq!(format_ts(-1000), "1969-12-31 23:59 UTC");
+    fn timestamps_format_in_the_given_zone() {
+        assert_eq!(format_ts_in(0, &TimeZone::UTC), "1970-01-01 00:00 UTC");
+        assert_eq!(
+            format_ts_in(951_782_400_000, &TimeZone::UTC),
+            "2000-02-29 00:00 UTC"
+        );
+        assert_eq!(format_ts_in(-1000, &TimeZone::UTC), "1969-12-31 23:59 UTC");
+        let berlin = TimeZone::posix("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+        assert_eq!(
+            format_ts_in(1_700_000_000_000, &berlin),
+            "2023-11-14 23:13 CET"
+        );
+    }
+
+    #[test]
+    fn out_of_range_timestamps_do_not_panic() {
+        assert_eq!(
+            format_ts_in(i64::MAX, &TimeZone::UTC),
+            format!("@{}", i64::MAX)
+        );
     }
 
     #[test]
