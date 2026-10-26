@@ -206,6 +206,11 @@ impl Index {
         }))
     }
 
+    /// Refs of every committed record in `hour`.
+    pub fn refs_in_hour(&self, hour: u32) -> Result<Vec<RecordRef>> {
+        self.refs_matching(query::exact_u64(self.fields.hour, u64::from(hour)).as_ref())
+    }
+
     pub fn indexed_hours(&self) -> BTreeSet<u32> {
         self.collect_hours().unwrap_or_default()
     }
@@ -257,6 +262,7 @@ impl Index {
         for segment in searcher.segment_readers() {
             let mut docs = Vec::new();
             weight.for_each_no_score(segment, &mut |batch| docs.extend_from_slice(batch))?;
+            docs.retain(|&doc| !segment.is_deleted(doc));
             found.push((segment.clone(), docs));
         }
         Ok(found)

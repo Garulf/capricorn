@@ -9,10 +9,23 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 capricorn-core.workspace = true
+capricorn-index.workspace = true
+capricorn-vault.workspace = true
+futures.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+libc = "0.2"
 ocrs = "0.13"
+rand.workspace = true
 regex.workspace = true
 rten = "0.26"
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+tracing.workspace = true
 webp = { version = "0.3", default-features = false }
+zbus = { version = "6", default-features = false, features = ["tokio"] }
+zeroize.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true

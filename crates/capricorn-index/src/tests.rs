@@ -351,3 +351,35 @@ fn search_latency_10k_docs() {
     let bytes = index.snapshot(&Watermark::default()).unwrap();
     eprintln!("snapshot {} bytes in {:?}", bytes.len(), start.elapsed());
 }
+
+#[test]
+fn refs_in_hour_lists_only_that_hour() {
+    let mut index = index_with(&[
+        (r(10, 0), screen(1, "alpha")),
+        (r(10, 3), screen(2, "beta")),
+        (r(11, 0), screen(3, "gamma")),
+    ]);
+    let mut found = index.refs_in_hour(10).unwrap();
+    found.sort();
+    assert_eq!(found, vec![r(10, 0), r(10, 3)]);
+    index.delete_ref(r(10, 0)).unwrap();
+    assert_eq!(index.refs_in_hour(10).unwrap(), vec![r(10, 3)]);
+    assert!(index.refs_in_hour(12).unwrap().is_empty());
+}
+
+#[test]
+fn timeline_skips_deleted_docs() {
+    let now = now_ms();
+    let mut index = index_with(&[
+        (r(1, 0), screen(now, "alpha")),
+        (r(1, 1), screen(now, "beta")),
+    ]);
+    index.delete_ref(r(1, 0)).unwrap();
+    let refs: Vec<RecordRef> = index
+        .timeline(0, i64::MAX)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.r)
+        .collect();
+    assert_eq!(refs, vec![r(1, 1)]);
+}

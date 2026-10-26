@@ -25,6 +25,10 @@ pub struct Config {
     pub ui_clients: Vec<PathBuf>,
     pub secret_patterns: Vec<String>,
     pub kdf: Option<KdfOverride>,
+    /// Overrides `paths::data_dir()` when set.
+    pub data_dir: Option<PathBuf>,
+    /// Overrides `paths::runtime_dir()` when set.
+    pub runtime_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -40,11 +44,23 @@ impl Default for Config {
             ui_clients: Vec::new(),
             secret_patterns: Vec::new(),
             kdf: None,
+            data_dir: None,
+            runtime_dir: None,
         }
     }
 }
 
 impl Config {
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone().unwrap_or_else(crate::paths::data_dir)
+    }
+
+    pub fn runtime_dir(&self) -> PathBuf {
+        self.runtime_dir
+            .clone()
+            .unwrap_or_else(crate::paths::runtime_dir)
+    }
+
     /// Compiles `secret_patterns`, failing on the first invalid regex.
     pub fn compiled_secret_patterns(&self) -> anyhow::Result<Vec<Regex>> {
         self.secret_patterns
@@ -76,6 +92,15 @@ mod tests {
         assert_eq!(cfg.retention_max_gib, Some(50));
         assert_eq!(cfg.forget_grace_mins, 15);
         assert!(cfg.kdf.is_none());
+        assert!(cfg.data_dir.is_none() && cfg.runtime_dir.is_none());
+    }
+
+    #[test]
+    fn explicit_dirs_win_over_env_defaults() {
+        let cfg: Config =
+            toml::from_str("data_dir = \"/tmp/d\"\nruntime_dir = \"/tmp/r\"\n").unwrap();
+        assert_eq!(cfg.data_dir(), PathBuf::from("/tmp/d"));
+        assert_eq!(cfg.runtime_dir(), PathBuf::from("/tmp/r"));
     }
 
     #[test]
