@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use capricorn_core::framing::{read_msg, write_msg};
-use capricorn_core::paths::capture_socket;
 use capricorn_core::proto::{CaptureCtl, CaptureMsg};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedSender};
@@ -38,7 +37,7 @@ impl DaemonLink {
 async fn run(mut rx: Receiver<CaptureMsg>, events: UnboundedSender<LinkEvent>) {
     let mut backoff = Backoff::default();
     while !rx.is_closed() {
-        let socket = capture_socket();
+        let socket = crate::daemon_socket();
         match UnixStream::connect(&socket).await {
             Ok(stream) => {
                 info!("connected to {}", socket.display());
