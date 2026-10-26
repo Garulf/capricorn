@@ -1,0 +1,38 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Garulf/capricorn"
+rust-version = "1.90"
+
+[workspace.dependencies]
+capricorn-core = { path = "crates/capricorn-core" }
+capricorn-vault = { path = "crates/capricorn-vault" }
+capricorn-index = { path = "crates/capricorn-index" }
+capricorn-hypr = { path = "crates/capricorn-hypr" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["use-std"] }
+toml = "0.9"
+regex = "1"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+zeroize = { version = "1", features = ["serde", "zeroize_derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+rand = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+[profile.dev.package."*"]
+opt-level = 2
