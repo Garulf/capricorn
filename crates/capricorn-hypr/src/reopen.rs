@@ -105,6 +105,9 @@ enum Launcher {
     },
     Browser {
         binary: &'static str,
+        /// Chromium ends its options at `--`. Firefox has no such marker (it reads
+        /// `--` as `-`), but refuses a `--new-window` value that starts with `-`.
+        end_of_options: bool,
     },
 }
 
@@ -141,19 +144,51 @@ fn launcher_for(class: &str) -> Option<Launcher> {
             cwd_args: &["--workdir"],
             joined_flag: false,
         },
-        "firefox" | "firefox-esr" => Browser { binary: "firefox" },
-        "librewolf" => Browser {
-            binary: "librewolf",
-        },
-        "zen" | "zen-browser" | "zen-beta" => Browser { binary: "zen" },
-        "chromium" | "chromium-browser" => Browser { binary: "chromium" },
-        "google-chrome" | "google-chrome-stable" => Browser {
-            binary: "google-chrome",
-        },
-        "brave" | "brave-browser" => Browser { binary: "brave" },
+        "firefox" | "firefox-esr" => firefox_like("firefox"),
+        "librewolf" => firefox_like("librewolf"),
+        "zen" | "zen-browser" | "zen-beta" => firefox_like("zen"),
+        "chromium" | "chromium-browser" => chromium_like("chromium"),
+        "google-chrome" | "google-chrome-stable" => chromium_like("google-chrome"),
+        "brave" | "brave-browser" => chromium_like("brave"),
         _ => return None,
     };
     Some(launcher)
+}
+
+fn firefox_like(binary: &'static str) -> Launcher {
+    Launcher::Browser {
+        binary,
+        end_of_options: false,
+    }
+}
+
+fn chromium_like(binary: &'static str) -> Launcher {
+    Launcher::Browser {
+        binary,
+        end_of_options: true,
+    }
+}
+
+/// Only http and https reach the browser. A stored URL without a scheme gets `https://`
+/// when it starts like a host name; anything else is dropped.
+fn web_url(url: &str) -> Option<String> {
+    if url.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let lower = url.to_ascii_lowercase();
+    if ["http://", "https://"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme) && lower.len() > scheme.len())
+    {
+        return Some(url.to_owned());
+    }
+    let host = url.split('/').next().unwrap_or_default();
+    let host_like = url.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && host.contains('.')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c));
+    host_like.then(|| format!("https://{url}"))
 }
 
 fn known_app_command(class: &str, spec: &ReopenSpec) -> Option<String> {
@@ -174,10 +209,17 @@ fn known_app_command(class: &str, spec: &ReopenSpec) -> Option<String> {
             }
             args
         }
-        Launcher::Browser { binary } => {
+        Launcher::Browser {
+            binary,
+            end_of_options,
+        } => {
             let mut args = vec![binary.to_owned()];
-            if let Some(url) = &spec.url {
-                args.extend(["--new-window".to_owned(), url.clone()]);
+            if let Some(url) = spec.url.as_deref().and_then(web_url) {
+                args.push("--new-window".to_owned());
+                if end_of_options {
+                    args.push("--".to_owned());
+                }
+                args.push(url);
             }
             args
         }
@@ -388,18 +430,47 @@ mod tests {
     #[test]
     fn reopen_browsers_use_new_window() {
         let cases = [
-            ("librewolf", "librewolf"),
-            ("zen", "zen"),
-            ("Chromium", "chromium"),
-            ("google-chrome", "google-chrome"),
-            ("Brave-browser", "brave"),
+            ("librewolf", "librewolf --new-window"),
+            ("zen", "zen --new-window"),
+            ("Chromium", "chromium --new-window --"),
+            ("google-chrome", "google-chrome --new-window --"),
+            ("Brave-browser", "brave --new-window --"),
         ];
-        for (class, binary) in cases {
+        for (class, launch) in cases {
             assert_eq!(
                 reopen(&spec(class, None, Some("https://x.org"))),
-                Some(format!("[workspace 3] {binary} --new-window https://x.org")),
+                Some(format!("[workspace 3] {launch} https://x.org")),
                 "{class}"
             );
+        }
+    }
+
+    #[test]
+    fn reopen_browser_adds_https_to_a_bare_host() {
+        assert_eq!(
+            reopen(&spec("chromium", None, Some("github.com/a/b"))).as_deref(),
+            Some("[workspace 3] chromium --new-window -- https://github.com/a/b")
+        );
+    }
+
+    #[test]
+    fn reopen_browser_drops_urls_that_are_not_web_addresses() {
+        let hostile = [
+            "-new-tab",
+            "--profile=/tmp/x",
+            "-evil.com",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "chrome://settings",
+            "https://",
+            "https://a.org/ b",
+            "localhost",
+        ];
+        for url in hostile {
+            for class in ["firefox", "chromium"] {
+                let command = reopen(&spec(class, None, Some(url))).unwrap();
+                assert!(command.ends_with(class), "{class} {url}: {command}");
+            }
         }
     }
 
