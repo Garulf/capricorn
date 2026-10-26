@@ -78,8 +78,11 @@ binary is connecting: it runs as a different uid, so it can't read the client's
 ### Metadata
 
 A disk thief can see which hours had activity and roughly how much was captured in each.
-For the hour that is still open, they can also see the number and size of individual
-captures. File times are reset to the start of the hour.
+For an hour that has not been sealed yet (the current one, or one left open by a crash
+until the next unlock) they can also see the number and size of individual captures.
+Segment modification times are reset to the start of the hour, but change times
+(`ctime`) and directory times still show roughly when the last capture was written, and
+the index and key files show when the vault was last locked or its password changed.
 
 ## Host requirements
 
@@ -104,5 +107,7 @@ processes they didn't start.
 - On rotated monitors, a frame that would need an excluded window blacked out is dropped
   entirely.
 - Small leftovers of short-lived keys may remain in freed heap memory inside the
-  encryption library until it is reused. With encrypted swap and no core dumps they don't
-  reach disk.
+  encryption library until it is reused. The same goes for the decrypted search index
+  and records after locking: the daemon drops them but does not overwrite every byte.
+  With encrypted swap and no core dumps none of this reaches disk, and the daemon's
+  memory is only readable by root.
