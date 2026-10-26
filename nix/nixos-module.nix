@@ -135,6 +135,16 @@ in
     systemd.coredump.settings.Coredump.Storage = lib.mkDefault "none";
     boot.kernel.sysctl."kernel.yama.ptrace_scope" = lib.mkDefault cfg.ptraceScope;
 
+    # Lets the daemon delay suspend until the vault is locked.
+    security.polkit.enable = true;
+    security.polkit.extraConfig = ''
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.freedesktop.login1.inhibit-delay-sleep" && subject.user == "capricorn") {
+          return polkit.Result.YES;
+        }
+      });
+    '';
+
     users.groups.capricorn = { };
     users.users = lib.mkMerge [
       {

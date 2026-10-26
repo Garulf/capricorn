@@ -54,6 +54,11 @@ self:
         machine.succeed("test \"$(stat -c '%U %a' /var/lib/capricorn)\" = 'capricorn 700'")
         as_user_fails("alice", "ls /var/lib/capricorn")
 
+    with subtest("daemon delays sleep until it has locked"):
+        machine.wait_until_succeeds(
+            "systemd-inhibit --list --no-pager | grep capricorn | grep -w delay", timeout=60
+        )
+
     with subtest("init and capture while locked"):
         as_user("alice", "printf 'correct horse\\n' | capricorn init --password-stdin --no-recovery")
         as_user("alice", "capricorn lock")
