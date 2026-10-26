@@ -6,6 +6,7 @@ mod config;
 mod context;
 mod cwd;
 mod exclude;
+mod focus;
 mod idle;
 mod inject;
 mod link;

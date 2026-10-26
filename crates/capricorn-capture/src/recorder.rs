@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, anyhow, bail};
@@ -14,7 +15,10 @@ use crate::clipboard::{self, ClipText};
 use crate::config::{self, Settings};
 use crate::context::{focused_context, fullscreen_paused, is_terminal, window_context};
 use crate::cwd::foreground_cwd;
-use crate::exclude::{Coverage, ExclusionMemory, Snapshot, blackout, focus_is_excluded, stable};
+use crate::exclude::{
+    Coverage, ExclusionMemory, Snapshot, blackout, focus_is_excluded, is_excluded, stable,
+};
+use crate::focus::{CLIPBOARD_LOOKBACK, FocusHistory, event_window_excluded};
 use crate::idle;
 use crate::link::{DaemonLink, LinkEvent};
 use crate::scheduler::{Decision, Input, Scheduler};
@@ -22,6 +26,9 @@ use crate::screencopy::capture_output;
 use crate::wl;
 
 const TICK: Duration = Duration::from_millis(250);
+/// Held back so focus changes that happened before the copy, but were read after it,
+/// are in the focus history when the entry is judged.
+const CLIPBOARD_HOLD: Duration = Duration::from_millis(500);
 
 pub fn now_ms() -> Ts {
     SystemTime::now()
@@ -32,7 +39,7 @@ pub fn now_ms() -> Ts {
 struct Channels {
     inputs: UnboundedReceiver<Input>,
     clip: UnboundedReceiver<ClipText>,
-    hypr: UnboundedReceiver<HyprEvent>,
+    hypr: UnboundedReceiver<(Instant, HyprEvent)>,
     link: UnboundedReceiver<LinkEvent>,
     died: UnboundedReceiver<anyhow::Error>,
 }
@@ -68,6 +75,8 @@ pub async fn run() -> anyhow::Result<()> {
         settings,
         reported: None,
         exclusions: ExclusionMemory::default(),
+        focus: FocusHistory::default(),
+        held_clips: VecDeque::new(),
     };
     info!("recording started");
     recorder
@@ -97,14 +106,14 @@ fn spawn_watcher(
 
 async fn forward_hypr_events(
     hypr: Hypr,
-    tx: UnboundedSender<HyprEvent>,
+    tx: UnboundedSender<(Instant, HyprEvent)>,
     died: UnboundedSender<anyhow::Error>,
 ) {
     let error = match hypr.events().await {
         Ok(events) => {
             let mut events = std::pin::pin!(events);
             while let Some(event) = events.next().await {
-                if tx.send(event).is_err() {
+                if tx.send((Instant::now(), event)).is_err() {
                     return;
                 }
             }
@@ -123,6 +132,13 @@ struct Recorder {
     settings: Settings,
     reported: Option<RecorderState>,
     exclusions: ExclusionMemory,
+    focus: FocusHistory,
+    held_clips: VecDeque<HeldClip>,
+}
+
+struct HeldClip {
+    entry: ClipboardEntry,
+    seen_at: Instant,
 }
 
 impl Recorder {
@@ -132,9 +148,12 @@ impl Recorder {
         self.refresh_fullscreen().await;
         loop {
             tokio::select! {
-                _ = ticks.tick() => self.on_input(Input::Tick).await,
+                _ = ticks.tick() => {
+                    self.release_clips();
+                    self.on_input(Input::Tick).await;
+                }
                 Some(input) = ch.inputs.recv() => self.on_input(input).await,
-                Some(event) = ch.hypr.recv() => self.on_hypr(event).await,
+                Some((at, event)) = ch.hypr.recv() => self.on_hypr(at, event).await,
                 Some(clip) = ch.clip.recv() => self.on_clip(clip).await,
                 Some(event) = ch.link.recv() => self.on_link(event).await,
                 Some(error) = ch.died.recv() => return Err(error),
@@ -155,10 +174,20 @@ impl Recorder {
 
     /// Every event but a title change may start an animation, including ones not parsed
     /// further such as `activespecial` or `changefloatingmode`.
-    async fn on_hypr(&mut self, event: HyprEvent) {
+    async fn on_hypr(&mut self, at: Instant, event: HyprEvent) {
         match event {
             HyprEvent::Versioned => {}
-            HyprEvent::WindowTitle => self.on_input(Input::TitleChanged).await,
+            HyprEvent::WindowTitle => {
+                self.refresh_focus().await;
+                self.on_input(Input::TitleChanged).await;
+            }
+            HyprEvent::ActiveWindow { class, title } => {
+                let snap = self.refresh_fullscreen().await;
+                let excluded =
+                    event_window_excluded(&class, &title, snap.as_ref(), &self.settings.rules);
+                self.focus.record(at, excluded);
+                self.on_input(Input::HyprEvent).await;
+            }
             _ => {
                 self.refresh_fullscreen().await;
                 self.on_input(Input::HyprEvent).await;
@@ -177,13 +206,34 @@ impl Recorder {
         }
     }
 
-    async fn refresh_fullscreen(&mut self) {
+    async fn refresh_fullscreen(&mut self) -> Option<Snapshot> {
         match self.snapshot().await {
             Ok(snap) => {
                 let excluded = fullscreen_paused(&snap, &self.settings.pause_fullscreen);
                 self.on_input(Input::Fullscreen { excluded }).await;
+                Some(snap)
             }
-            Err(e) => warn!("reading Hyprland state: {e:#}"),
+            Err(e) => {
+                warn!("reading Hyprland state: {e:#}");
+                None
+            }
+        }
+    }
+
+    /// Cheaper than a full snapshot, for events as frequent as title changes.
+    async fn refresh_focus(&mut self) {
+        let at = Instant::now();
+        match self.hypr.active_window().await {
+            Ok(active) => {
+                let excluded = active
+                    .as_ref()
+                    .is_some_and(|c| is_excluded(c, &self.settings.rules));
+                self.focus.record(at, excluded);
+            }
+            Err(e) => {
+                warn!("reading the focused window: {e:#}");
+                self.focus.record(at, true);
+            }
         }
     }
 
@@ -195,7 +245,7 @@ impl Recorder {
         self.reported = self.link.send(CaptureMsg::Recorder(state)).then_some(state);
     }
 
-    /// Every snapshot also feeds the memory of excluded windows.
+    /// Every snapshot also feeds the focus history and the memory of excluded windows.
     async fn snapshot(&mut self) -> anyhow::Result<Snapshot> {
         let (clients, monitors, active) = tokio::try_join!(
             self.hypr.clients(),
@@ -207,8 +257,10 @@ impl Recorder {
             monitors,
             active,
         };
-        self.exclusions
-            .observe(&snap, &self.settings.rules, Instant::now());
+        let now = Instant::now();
+        let rules = &self.settings.rules;
+        self.exclusions.observe(&snap, rules, now);
+        self.focus.record_snapshot(&snap, rules, now);
         Ok(snap)
     }
 
@@ -306,8 +358,35 @@ impl Recorder {
             text: clip.text,
             source: focused_context(&snap, &self.settings.rules),
         };
-        if !self.link.send(CaptureMsg::Clipboard(entry)) {
-            debug!("clipboard entry dropped: daemon not connected or busy");
+        self.held_clips.push_back(HeldClip {
+            entry,
+            seen_at: clip.seen_at,
+        });
+    }
+
+    /// Sends held entries once `CLIPBOARD_HOLD` has passed, unless an excluded window had
+    /// focus within `CLIPBOARD_LOOKBACK` of the copy or since.
+    fn release_clips(&mut self) {
+        let now = Instant::now();
+        while let Some(held) = self.held_clips.front() {
+            if now.saturating_duration_since(held.seen_at) < CLIPBOARD_HOLD {
+                return;
+            }
+            let Some(held) = self.held_clips.pop_front() else {
+                return;
+            };
+            if self.scheduler.state() != RecorderState::Recording {
+                continue;
+            }
+            if self.focus.excluded_since_lookback(held.seen_at) {
+                debug!(
+                    "clipboard entry dropped: an excluded window had focus within {CLIPBOARD_LOOKBACK:?}"
+                );
+                continue;
+            }
+            if !self.link.send(CaptureMsg::Clipboard(held.entry)) {
+                debug!("clipboard entry dropped: daemon not connected or busy");
+            }
         }
     }
 }
