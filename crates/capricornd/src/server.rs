@@ -177,7 +177,7 @@ async fn accept_captures(listener: UnixListener, daemon: Arc<Daemon>, queue: Arc
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Some(stream) = admit(accepted, &daemon, |cfg| &cfg.capture_clients).await else {
+                let Some(stream) = admit(accepted, &daemon).await else {
                     continue;
                 };
                 let Some(slot) = take_slot(&slots) else {
@@ -198,7 +198,7 @@ async fn accept_clients(listener: UnixListener, daemon: Arc<Daemon>) {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Some(stream) = admit(accepted, &daemon, |cfg| &cfg.ui_clients).await else {
+                let Some(stream) = admit(accepted, &daemon).await else {
                     continue;
                 };
                 let Some(slot) = take_slot(&slots) else {
@@ -224,7 +224,6 @@ fn take_slot(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
 async fn admit(
     accepted: io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
     daemon: &Daemon,
-    allowed_exes: impl Fn(&Config) -> &Vec<PathBuf>,
 ) -> Option<UnixStream> {
     let stream = match accepted {
         Ok((stream, _)) => stream,
@@ -234,8 +233,7 @@ async fn admit(
             return None;
         }
     };
-    let cfg = daemon.config();
-    match check_peer(&stream, &cfg.allowed_uids, allowed_exes(cfg)) {
+    match check_peer(&stream, &daemon.config().allowed_uids) {
         Ok(()) => Some(stream),
         Err(error) => {
             warn!(error = format!("{error:#}"), "refused connection");
