@@ -241,7 +241,7 @@ impl Recorder {
     }
 
     fn send_frame(&self, ts: Ts, snap: &Snapshot, mon: &Monitor, img: RgbaImage) {
-        let mut window = window_context(snap, mon);
+        let mut window = window_context(snap, mon, &self.settings.rules);
         if is_terminal(&window.class) {
             window.cwd = window.pid.and_then(foreground_cwd);
         }
@@ -279,7 +279,7 @@ impl Recorder {
         let entry = ClipboardEntry {
             ts: now_ms(),
             text: clip.text,
-            source: focused_context(&snap),
+            source: focused_context(&snap, &self.settings.rules),
         };
         if !self.link.send(CaptureMsg::Clipboard(entry)) {
             debug!("clipboard entry dropped: daemon not connected or busy");
