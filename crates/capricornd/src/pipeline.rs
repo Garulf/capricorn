@@ -2,7 +2,7 @@ use std::sync::{Arc, LazyLock};
 
 use anyhow::{Result, bail};
 use capricorn_core::Record;
-use capricorn_core::proto::{ClipboardEntry, Frame, Kind};
+use capricorn_core::proto::{ClipboardEntry, Frame, Kind, WindowContext};
 use capricorn_core::secrets::{find_secrets, is_secret};
 use image::RgbImage;
 use image::imageops::{self, FilterType};
@@ -10,7 +10,7 @@ use regex::Regex;
 
 use crate::dedupe::Dedupe;
 use crate::ocr::{Ocr, Word};
-use crate::redact::redact;
+use crate::redact::{redact, redact_text};
 
 const IMAGE_QUALITY: f32 = 75.0;
 const THUMB_QUALITY: f32 = 60.0;
@@ -74,7 +74,7 @@ impl Pipeline {
         Ok(Some(Record {
             ts: frame.ts,
             kind: Kind::Screen,
-            window: frame.window,
+            window: self.scrubbed(frame.window),
             text,
             url,
             image: Some(encode_webp(&img, IMAGE_QUALITY)?),
@@ -90,10 +90,20 @@ impl Pipeline {
         Some(Record {
             ts: entry.ts,
             kind: Kind::Clipboard,
-            window: entry.source,
+            window: self.scrubbed(entry.source),
             text: entry.text,
             ..Record::default()
         })
+    }
+}
+
+impl Pipeline {
+    /// Window titles and working directories can show tokens too (a terminal running
+    /// `curl -H "Authorization: ..."`), so they get the same replacement as OCR text.
+    fn scrubbed(&self, mut window: WindowContext) -> WindowContext {
+        window.title = redact_text(&window.title, &self.extra);
+        window.cwd = window.cwd.map(|cwd| redact_text(&cwd, &self.extra));
+        window
     }
 }
 
@@ -274,6 +284,23 @@ mod tests {
             p.clipboard(clipboard(&format!("export T={}", github_token())))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn secrets_in_title_and_cwd_are_redacted() {
+        let token = github_token();
+        let mut p = pipeline(Vec::new());
+        let mut f = frame(64, 32, false);
+        f.window.title = format!("curl -H {token}");
+        f.window.cwd = Some(format!("/tmp/{token}"));
+        let record = p.frame(f).unwrap().unwrap();
+        assert_eq!(record.window.title, "curl -H [redacted]");
+        assert_eq!(record.window.cwd.as_deref(), Some("/tmp/[redacted]"));
+
+        let mut entry = clipboard("plain text");
+        entry.source.title = format!("token {token}");
+        let clip = p.clipboard(entry).unwrap();
+        assert_eq!(clip.window.title, "token [redacted]");
     }
 
     #[test]
