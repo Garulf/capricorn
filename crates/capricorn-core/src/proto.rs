@@ -221,6 +221,7 @@ pub enum ClientReq {
     Pause,
     Resume,
     Touch,
+    TogglePause,
 }
 
 #[allow(clippy::large_enum_variant)]

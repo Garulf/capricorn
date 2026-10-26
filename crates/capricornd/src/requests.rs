@@ -102,6 +102,10 @@ impl Daemon {
                 self.set_paused(false);
                 ClientResp::Ok
             }
+            ClientReq::TogglePause => {
+                self.toggle_paused();
+                ClientResp::Ok
+            }
             ClientReq::Touch => {
                 self.touch(conn);
                 ClientResp::Ok

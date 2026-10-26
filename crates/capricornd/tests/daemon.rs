@@ -917,6 +917,11 @@ async fn pause_reaches_capture_client() {
     assert_eq!(ui.call(ClientReq::Resume).await, ClientResp::Ok);
     let ctl: CaptureCtl = read_msg(&mut capture.stream).await.unwrap();
     assert_eq!(ctl, CaptureCtl::Resume);
+    for expected in [CaptureCtl::Pause, CaptureCtl::Resume] {
+        assert_eq!(ui.call(ClientReq::TogglePause).await, ClientResp::Ok);
+        let ctl: CaptureCtl = read_msg(&mut capture.stream).await.unwrap();
+        assert_eq!(ctl, expected);
+    }
 
     let mut newer = daemon.capture(&ocr).await;
     newer

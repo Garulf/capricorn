@@ -407,12 +407,17 @@ async fn forget_defaults_to_five_minutes() {
 async fn pause_resume_lock_send_matching_requests() {
     let env = Env::new();
     env.start_daemon(|_| ClientResp::Ok);
-    for sub in ["pause", "resume", "lock"] {
+    for sub in ["pause", "resume", "toggle", "lock"] {
         assert!(env.run(&[sub], "").await.status.success(), "{sub}");
     }
     assert_eq!(
         env.requests(),
-        vec![ClientReq::Pause, ClientReq::Resume, ClientReq::Lock]
+        vec![
+            ClientReq::Pause,
+            ClientReq::Resume,
+            ClientReq::TogglePause,
+            ClientReq::Lock
+        ]
     );
 }
 
