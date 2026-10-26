@@ -27,6 +27,7 @@ pub fn encrypt_stream(key: &[u8; 32], plaintext: &[u8], out: &mut impl Write) ->
 
 /// Returns `len` plaintext bytes starting at `offset`, decrypting only the chunks that
 /// cover the range. `body_start` is where the stream (its nonce prefix) begins in `file`.
+/// Fails without allocating when `body_plain_len` claims more data than `file` holds.
 pub fn read_range(
     key: &[u8; 32],
     file: &mut (impl Read + Seek),
@@ -39,6 +40,7 @@ pub fn read_range(
         .checked_add(len)
         .filter(|&end| end <= body_plain_len)
         .ok_or_else(|| invalid_input("range past end of stream"))?;
+    check_file_holds_stream(file, body_start, body_plain_len)?;
     let mut out = Zeroizing::new(Vec::with_capacity(usize_from(len)?));
     if len == 0 {
         return Ok(out);
@@ -126,10 +128,28 @@ impl<W: Write> StreamEncryptor<W> {
     }
 }
 
-/// Total on-disk length of a stream holding `plain_len` bytes.
-pub fn sealed_len(plain_len: u64) -> u64 {
+/// Total on-disk length of a stream holding `plain_len` bytes, `None` if it overflows.
+pub fn sealed_len(plain_len: u64) -> Option<u64> {
     let layout = Layout::new(plain_len);
-    PREFIX_LEN as u64 + layout.chunk_count * TAG_LEN as u64 + plain_len
+    layout
+        .chunk_count
+        .checked_mul(TAG_LEN as u64)?
+        .checked_add(plain_len)?
+        .checked_add(PREFIX_LEN as u64)
+}
+
+fn check_file_holds_stream(
+    file: &mut (impl Read + Seek),
+    body_start: u64,
+    body_plain_len: u64,
+) -> io::Result<()> {
+    let needed = sealed_len(body_plain_len)
+        .and_then(|len| len.checked_add(body_start))
+        .ok_or_else(|| invalid_data("stream length overflows"))?;
+    if file.seek(SeekFrom::End(0))? < needed {
+        return Err(invalid_data("stream longer than file"));
+    }
+    Ok(())
 }
 
 struct Layout {
@@ -162,7 +182,10 @@ impl Layout {
         body_start: u64,
         index: u64,
     ) -> io::Result<Zeroizing<Vec<u8>>> {
-        let position = body_start + PREFIX_LEN as u64 + index * SEALED_CHUNK_LEN;
+        let position = index
+            .checked_mul(SEALED_CHUNK_LEN)
+            .and_then(|offset| offset.checked_add(body_start + PREFIX_LEN as u64))
+            .ok_or_else(|| invalid_data("chunk offset overflows"))?;
         let mut sealed = vec![0u8; usize_from(self.plain_len_of(index))? + TAG_LEN];
         file.seek(SeekFrom::Start(position))?;
         file.read_exact(&mut sealed)?;
@@ -176,7 +199,7 @@ impl Layout {
                 },
             )
             .map(Zeroizing::new)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunk failed authentication"))
+            .map_err(|_| invalid_data("chunk failed authentication"))
     }
 }
 
@@ -204,6 +227,10 @@ fn usize_from(value: u64) -> io::Result<usize> {
 
 fn invalid_input(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.to_string())
+}
+
+fn invalid_data(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
 
 #[cfg(test)]
@@ -247,7 +274,10 @@ mod tests {
         let key = random_key();
         let plaintext = random_bytes(1024 * 1024);
         let sealed = encrypt(&key, &plaintext);
-        assert_eq!(sealed.len() as u64, sealed_len(plaintext.len() as u64));
+        assert_eq!(
+            Some(sealed.len() as u64),
+            sealed_len(plaintext.len() as u64)
+        );
         let total = plaintext.len() as u64;
         let mut rng = rand::rng();
         for _ in 0..50 {
@@ -270,7 +300,7 @@ mod tests {
         for len in [0, 1, CHUNK_LEN - 1, CHUNK_LEN, CHUNK_LEN + 1, 2 * CHUNK_LEN] {
             let plaintext = random_bytes(len);
             let sealed = encrypt(&key, &plaintext);
-            assert_eq!(sealed.len() as u64, sealed_len(len as u64));
+            assert_eq!(Some(sealed.len() as u64), sealed_len(len as u64));
             let got = read(&key, &sealed, len as u64, 0, len as u64).unwrap();
             assert_eq!(got, plaintext);
         }
@@ -331,5 +361,20 @@ mod tests {
         let b = encrypt(&key, b"same");
         assert_ne!(a[..PREFIX_LEN], b[..PREFIX_LEN]);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hostile_lengths_fail_without_panic() {
+        let key = random_key();
+        let sealed = encrypt(&key, b"hello world");
+        assert_eq!(sealed_len(u64::MAX), None);
+        for claimed in [u64::MAX, u64::MAX - 8, 1 << 40, 12] {
+            let result = read(&key, &sealed, claimed, 0, 5);
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+            let tail = read(&key, &sealed, claimed, claimed - 5, 5);
+            assert!(tail.is_err());
+        }
+        let far_start = read_range(&key, &mut Cursor::new(&sealed), u64::MAX - 3, 11, 0, 5);
+        assert!(far_start.is_err());
     }
 }

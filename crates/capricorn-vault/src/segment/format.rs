@@ -1,9 +1,10 @@
 //! Pieces shared by the open and sealed segment formats: file names, sealed key
 //! headers and durable file replacement.
 
-use std::fs::{self, File};
+use std::fs::{self, File, FileTimes};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use capricorn_core::proto::Ts;
 use tempfile::NamedTempFile;
@@ -19,6 +20,7 @@ const MAX_KEY_BLOB_LEN: u32 = 64 * 1024;
 const SEALED_SUFFIX: &str = ".seg";
 const OPEN_SUFFIX: &str = ".open";
 const TEMP_SUFFIX: &str = ".tmp";
+const QUARANTINE_SUFFIX: &str = ".bad";
 
 /// Hour bucket (unix seconds / 3600) of a millisecond timestamp.
 pub fn hour_of(ts: Ts) -> u32 {
@@ -186,8 +188,16 @@ pub(super) fn new_temp(dir: &Path, hour: u32) -> Result<NamedTempFile> {
         .tempfile_in(dir)?)
 }
 
-/// fsync the temp file, rename it over `dest`, then fsync the directory.
-pub(super) fn commit_temp(temp: NamedTempFile, dest: &Path) -> Result<()> {
+/// Sets a segment file's mtime and atime to the start of its hour, so file times reveal
+/// no more than the hour bucket the name already does. ctime cannot be set.
+pub(super) fn stamp_hour(file: &File, hour: u32) -> io::Result<()> {
+    let start = SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(hour) * 3600);
+    file.set_times(FileTimes::new().set_modified(start).set_accessed(start))
+}
+
+/// Stamps and fsyncs the temp file, renames it over `dest`, then fsyncs the directory.
+pub(super) fn commit_temp(temp: NamedTempFile, dest: &Path, hour: u32) -> Result<()> {
+    stamp_hour(temp.as_file(), hour)?;
     temp.as_file().sync_all()?;
     temp.persist(dest).map_err(|e| e.error)?;
     sync_parent(dest)
@@ -199,6 +209,31 @@ pub(super) fn remove_durably(path: &Path) -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Renames `path` to `<name>.bad`, out of the way of every segment operation, and
+/// returns the new path. The file still holds only ciphertext.
+pub(super) fn quarantine(path: &Path) -> Result<PathBuf> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(QUARANTINE_SUFFIX);
+    let target = path.with_file_name(name);
+    fs::rename(path, &target)?;
+    sync_parent(&target)?;
+    Ok(target)
+}
+
+/// Quarantined files of `hour`, so removing the hour removes them too.
+pub(super) fn quarantined_files(dir: &Path, hour: u32) -> Result<Vec<PathBuf>> {
+    let prefix = format!("{hour}.");
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(QUARANTINE_SUFFIX) {
+            files.push(dir.join(&*name));
+        }
+    }
+    Ok(files)
 }
 
 fn sync_parent(path: &Path) -> Result<()> {

@@ -19,8 +19,8 @@ use zeroize::Zeroizing;
 
 use crate::keyfile::{Identity, Recipient, Result, VaultError};
 use format::{
-    FileKind, HourKey, SegFile, corrupt, list_files, open_path, remove_durably, remove_stale_temps,
-    sealed_path,
+    FileKind, HourKey, SegFile, corrupt, list_files, open_path, quarantine, quarantined_files,
+    remove_durably, remove_stale_temps, sealed_path,
 };
 pub use format::{HOUR_MS, hour_end_ms, hour_of, hour_start_ms};
 use open_file::Frame;
@@ -33,6 +33,19 @@ pub struct SegmentInfo {
     pub hour: u32,
     pub sealed: bool,
     pub bytes: u64,
+}
+
+/// Outcome of [`SegmentStore::compact_orphans`]. Failures are per hour, so one bad file
+/// never blocks the other hours.
+#[derive(Debug, Default)]
+pub struct CompactReport {
+    /// Hours whose orphans were merged into a live segment or a `.seg`.
+    pub compacted: Vec<u32>,
+    /// Orphans that could not be read, renamed to `<name>.bad` (still only ciphertext).
+    pub quarantined: Vec<(PathBuf, VaultError)>,
+    /// Hours that failed for a reason no single orphan explains, such as an I/O error or
+    /// a corrupt `.seg`. Their orphans are left in place for the next call.
+    pub failed: Vec<(u32, VaultError)>,
 }
 
 /// Hourly segment files under one directory.
@@ -52,6 +65,10 @@ pub struct SegmentInfo {
 ///
 /// `forget_since` reaches open hours only, so the caller must keep `grace_mins` at least
 /// as long as its longest forget window.
+///
+/// Until an hour is sealed its `.open` file reveals the size of each record's ciphertext
+/// and the record count. File mtimes and atimes are reset to the hour start after every
+/// write; ctime and the directory's times still change on each write.
 ///
 /// Mutation takes `&mut self`; the store is `Send + Sync`. A process must not open two
 /// stores on the same directory.
@@ -78,18 +95,21 @@ impl SegmentStore {
         })
     }
 
-    /// Appends to the newest open hour, or opens the hour of `max(now, rec.ts)` if that is
-    /// later. A clock that went backwards therefore keeps writing to the current hour, and
-    /// an hour that already has a `.seg` is never reopened.
+    /// Appends to the newest open hour, or opens the hour of `now` if that is later. The
+    /// bucket depends on `now` only, so a bogus `rec.ts` cannot pin captures to an hour
+    /// that never seals; `rec.ts` is stored as is. A clock that went backwards keeps
+    /// writing to the current hour, and an hour that already has a `.seg` is never reopened.
     pub fn append(&mut self, rec: &Record, now: Ts) -> Result<RecordRef> {
-        let hour = self.target_hour(now.max(rec.ts))?;
+        let hour = self.target_hour(now)?;
         let plaintext = encode(rec)?;
-        let seq = self.live_segment(hour)?.append(&plaintext, rec.ts)?;
+        let seq = self
+            .live_segment(hour)?
+            .append(&plaintext, rec.ts.max(now))?;
         Ok(RecordRef { hour, seq })
     }
 
-    /// Removes records with `ts >= since` from the open hours and deletes orphans that
-    /// could hold such records. Returns how many records were removed.
+    /// Removes records with `max(ts, append time) >= since` from the open hours and
+    /// deletes orphans that could hold such records. Returns how many records were removed.
     pub fn forget_since(&mut self, since: Ts) -> Result<u32> {
         let mut removed = 0;
         for segment in self.live.values_mut() {
@@ -107,12 +127,11 @@ impl SegmentStore {
     /// Seals every open hour with `now >= hour_end + grace_mins`. Returns the hours that
     /// now have a `.seg` written from memory.
     pub fn seal_due(&mut self, now: Ts, grace_mins: u32) -> Result<Vec<u32>> {
-        let grace = i64::from(grace_mins) * 60_000;
         let due: Vec<u32> = self
             .live
             .keys()
             .copied()
-            .filter(|&hour| now >= hour_end_ms(hour) + grace)
+            .filter(|&hour| is_due(hour, now, grace_mins))
             .collect();
         let mut sealed = Vec::new();
         for hour in due {
@@ -129,22 +148,30 @@ impl SegmentStore {
         Ok(sealed)
     }
 
-    /// Merges orphan files into the live file of their hour, or into the hour's `.seg`.
-    /// Seqs are kept, so refs stay valid; a seq that collides with a different record is
-    /// renumbered above every existing seq of the hour. Returns the hours touched.
-    pub fn compact_orphans(&mut self, id: &Identity) -> Result<Vec<u32>> {
+    /// Merges orphan files using the identity. An hour that is due (as in
+    /// [`SegmentStore::seal_due`]) or already has a `.seg` is sealed; any other hour gets
+    /// a live segment under a fresh in-memory key, so `forget_since` and appends keep
+    /// working on it. Seqs are kept, so refs stay valid; a seq that collides with a
+    /// different record is renumbered above every existing seq of the hour.
+    pub fn compact_orphans(
+        &mut self,
+        id: &Identity,
+        now: Ts,
+        grace_mins: u32,
+    ) -> Result<CompactReport> {
         let mut by_hour: BTreeMap<u32, Vec<SegFile>> = BTreeMap::new();
         for orphan in self.orphans()? {
             by_hour.entry(orphan.hour).or_default().push(orphan);
         }
-        for (&hour, orphans) in &by_hour {
-            if self.live.contains_key(&hour) {
-                self.absorb_into_live(hour, orphans, id)?;
-            } else {
-                self.seal_orphans(hour, orphans, id)?;
+        let mut report = CompactReport::default();
+        for (hour, orphans) in by_hour {
+            let seal = is_due(hour, now, grace_mins);
+            match self.compact_hour(hour, &orphans, id, seal) {
+                Ok(()) => report.compacted.push(hour),
+                Err(error) => self.recover_hour(hour, orphans, id, seal, error, &mut report),
             }
         }
-        Ok(by_hour.into_keys().collect())
+        Ok(report)
     }
 
     /// Records of open hours read without `id`; anything else needs it. Costs one file
@@ -257,12 +284,15 @@ impl SegmentStore {
         {
             remove_durably(&file.path)?;
         }
+        for path in quarantined_files(&self.dir, hour)? {
+            remove_durably(&path)?;
+        }
         self.forget_table(hour);
         Ok(())
     }
 
-    fn target_hour(&self, effective: Ts) -> Result<u32> {
-        let wanted = hour_of(effective);
+    fn target_hour(&self, now: Ts) -> Result<u32> {
+        let wanted = hour_of(now);
         if let Some(&latest) = self.live.keys().next_back()
             && latest >= wanted
         {
@@ -307,6 +337,56 @@ impl SegmentStore {
             .into_iter()
             .filter(|f| f.hour == hour)
             .collect())
+    }
+
+    fn compact_hour(
+        &mut self,
+        hour: u32,
+        orphans: &[SegFile],
+        id: &Identity,
+        seal: bool,
+    ) -> Result<()> {
+        let has_seg = sealed_path(&self.dir, hour).exists();
+        if !self.live.contains_key(&hour) && !seal && !has_seg {
+            self.live_segment(hour)?;
+        }
+        if self.live.contains_key(&hour) {
+            self.absorb_into_live(hour, orphans, id)
+        } else {
+            self.seal_orphans(hour, orphans, id)
+        }
+    }
+
+    /// Quarantines the orphans that cannot be read on their own, then retries the rest.
+    fn recover_hour(
+        &mut self,
+        hour: u32,
+        orphans: Vec<SegFile>,
+        id: &Identity,
+        seal: bool,
+        error: VaultError,
+        report: &mut CompactReport,
+    ) {
+        let total = orphans.len();
+        let mut readable = Vec::new();
+        for orphan in orphans {
+            let Err(reason) = check_orphan(&orphan, id) else {
+                readable.push(orphan);
+                continue;
+            };
+            match quarantine(&orphan.path) {
+                Ok(path) => report.quarantined.push((path, reason)),
+                Err(error) => report.failed.push((hour, error)),
+            }
+        }
+        if readable.len() == total {
+            report.failed.push((hour, error));
+        } else if !readable.is_empty() {
+            match self.compact_hour(hour, &readable, id, seal) {
+                Ok(()) => report.compacted.push(hour),
+                Err(error) => report.failed.push((hour, error)),
+            }
+        }
     }
 
     /// Returns false when nothing was written: the segment was empty, or the hour already
@@ -504,7 +584,7 @@ impl LiveSegment {
     fn push(&mut self, seq: u32, plaintext: &[u8], ts: Ts) -> Result<()> {
         let bytes = open_file::seal_frame(&self.key, self.hour, seq, plaintext)?;
         let offset = self.end();
-        open_file::append_frame(&self.path, offset, &bytes)?;
+        open_file::append_frame(&self.path, self.hour, offset, &bytes)?;
         let frame = Frame {
             seq,
             offset,
@@ -569,36 +649,57 @@ impl LiveSegment {
 
 /// Chooses the seq each merged record is stored under.
 struct SeqPlacer {
-    digests: HashMap<u32, [u8; 32]>,
+    by_seq: HashMap<u32, [u8; 32]>,
+    placed: HashSet<[u8; 32]>,
     next_free: u32,
 }
 
 impl SeqPlacer {
     fn above(seqs: impl Iterator<Item = u32>) -> Self {
         Self {
-            digests: HashMap::new(),
+            by_seq: HashMap::new(),
+            placed: HashSet::new(),
             next_free: seqs.max().map_or(0, |max| max.saturating_add(1)),
         }
     }
 
-    /// `None` when the identical record was already placed under `seq`: a seal that
-    /// crashed between writing the `.seg` and removing the `.open` leaves both behind.
+    /// `None` when the record is already placed: a seal that crashed between writing the
+    /// `.seg` and removing the `.open` leaves both behind, and a compaction retried after
+    /// a failure finds the records it already absorbed under their (maybe renumbered) seq.
     fn place(&mut self, seq: u32, record: &[u8]) -> Option<u32> {
         let digest: [u8; 32] = Sha256::digest(record).into();
-        match self.digests.get(&seq) {
-            None => {
-                self.digests.insert(seq, digest);
-                Some(seq)
-            }
-            Some(existing) if *existing == digest => None,
+        let placed_seq = match self.by_seq.get(&seq) {
+            None => seq,
+            Some(existing) if *existing == digest => return None,
+            Some(_) if self.placed.contains(&digest) => return None,
             Some(_) => {
                 let renumbered = self.next_free;
                 self.next_free = self.next_free.saturating_add(1);
-                self.digests.insert(renumbered, digest);
-                Some(renumbered)
+                renumbered
             }
-        }
+        };
+        self.by_seq.insert(placed_seq, digest);
+        self.placed.insert(digest);
+        Some(placed_seq)
     }
+}
+
+fn is_due(hour: u32, now: Ts, grace_mins: u32) -> bool {
+    now >= hour_end_ms(hour) + i64::from(grace_mins) * 60_000
+}
+
+/// Reads every record of an orphan, to tell a bad file apart from a failing hour.
+fn check_orphan(orphan: &SegFile, id: &Identity) -> Result<()> {
+    let scan = open_file::scan(&orphan.path)?;
+    let key = scan.unseal(id, orphan.hour)?;
+    open_file::for_each_record(
+        &orphan.path,
+        &key,
+        orphan.hour,
+        &scan.frames,
+        true,
+        |_, bytes| decode(&bytes).map(drop),
+    )
 }
 
 fn scan_all(files: &[SegFile]) -> Result<Vec<open_file::Scan>> {

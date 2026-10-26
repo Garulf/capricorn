@@ -9,4 +9,4 @@ pub use keyfile::{
     seal_small,
 };
 pub use retention::plan_retention;
-pub use segment::{SegmentInfo, SegmentStore};
+pub use segment::{CompactReport, SegmentInfo, SegmentStore};
