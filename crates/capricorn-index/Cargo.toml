@@ -7,3 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+capricorn-core.workspace = true
+anyhow.workspace = true
+postcard.workspace = true
+serde.workspace = true
+tantivy = { version = "0.27", default-features = false, features = ["lz4-compression"] }
+zeroize.workspace = true
