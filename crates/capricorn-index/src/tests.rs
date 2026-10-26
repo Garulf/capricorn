@@ -383,3 +383,14 @@ fn timeline_skips_deleted_docs() {
         .collect();
     assert_eq!(refs, vec![r(1, 1)]);
 }
+
+#[test]
+fn delete_refs_removes_exactly_those() {
+    let mut index = index_with(&[
+        (r(3, 0), screen(1, "kiwi")),
+        (r(3, 1), screen(2, "kiwi")),
+        (r(4, 0), screen(3, "kiwi")),
+    ]);
+    index.delete_refs(&[r(3, 1), r(4, 0)]).unwrap();
+    assert_eq!(refs(&index, &query("kiwi")), vec![r(3, 0)]);
+}
