@@ -58,6 +58,18 @@ fn append_at(store: &mut SegmentStore, ts: Ts, text: &str) -> (RecordRef, Record
     (store.append(&record, ts).unwrap(), record)
 }
 
+/// Compacts and asserts nothing was quarantined or failed.
+fn compacted(store: &mut SegmentStore, fx: &Fixture, now: Ts) -> Vec<u32> {
+    let report = store.compact_orphans(&fx.id, now, GRACE).unwrap();
+    assert!(report.quarantined.is_empty(), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+    report.compacted
+}
+
+fn mtime(path: &Path) -> std::time::SystemTime {
+    fs::metadata(path).unwrap().modified().unwrap()
+}
+
 fn texts(records: &[(RecordRef, Record)]) -> Vec<&str> {
     records.iter().map(|(_, r)| r.text.as_str()).collect()
 }
@@ -199,7 +211,7 @@ fn orphan_open_segment_compacts_on_unlock() {
     );
     assert!(!store.hours().unwrap()[0].sealed);
 
-    assert_eq!(store.compact_orphans(&fx.id).unwrap(), vec![H]);
+    assert_eq!(compacted(&mut store, &fx, at(H, 3)), vec![H]);
     assert_eq!(fx.file_names(), vec![format!("{H}.1.open")]);
     for (r, text) in [(a, "a"), (b, "b"), (c, "c")] {
         assert_eq!(store.read(r, None).unwrap().text, text);
@@ -222,12 +234,12 @@ fn orphans_of_past_hour_compact_into_sealed_segment() {
     drop(first);
     let mut store = fx.store();
     append_at(&mut store, at(H + 3, 0), "later");
-    assert_eq!(store.compact_orphans(&fx.id).unwrap(), vec![H]);
+    assert_eq!(compacted(&mut store, &fx, at(H + 3, 0)), vec![H]);
     assert!(fx.file_names().contains(&format!("{H}.seg")));
     assert!(!fx.file_names().contains(&format!("{H}.open")));
     assert!(matches!(store.read(a, None), Err(VaultError::Locked)));
     assert_eq!(store.read(a, Some(&fx.id)).unwrap().text, "a");
-    assert!(store.compact_orphans(&fx.id).unwrap().is_empty());
+    assert!(compacted(&mut store, &fx, at(H + 3, 0)).is_empty());
 }
 
 #[test]
@@ -243,7 +255,7 @@ fn interrupted_seal_does_not_duplicate_records() {
     fs::write(&open, copy).unwrap();
 
     let mut store = fx.store();
-    assert_eq!(store.compact_orphans(&fx.id).unwrap(), vec![H]);
+    assert_eq!(compacted(&mut store, &fx, at(H + 2, 0)), vec![H]);
     let all = store.records_in(H, &fx.id).unwrap();
     assert_eq!(texts(&all), vec!["a", "b"]);
     assert_eq!(fx.file_names(), vec![format!("{H}.seg")]);
@@ -276,7 +288,7 @@ fn out_of_order_ts_stays_in_open_segment() {
 
     let ahead = rec(at(H + 2, 1), "ahead");
     let r_ahead = store.append(&ahead, at(H + 1, 59)).unwrap();
-    assert_eq!(r_ahead.hour, H + 2);
+    assert_eq!(r_ahead.hour, H + 1);
 }
 
 #[test]
@@ -321,7 +333,7 @@ fn torn_tail_is_ignored_on_reopen() {
     ));
     let (next, _) = append_at(&mut store, at(H, 30), "next");
     assert_eq!(store.read(next, None).unwrap().text, "next");
-    store.compact_orphans(&fx.id).unwrap();
+    compacted(&mut store, &fx, at(H, 31));
     assert_eq!(
         texts(&store.records_in(H, &fx.id).unwrap()),
         vec!["r0", "r1", "next"]
@@ -346,7 +358,7 @@ fn corrupt_final_frame_of_orphan_is_ignored() {
         store.read(r1, Some(&fx.id)),
         Err(VaultError::NotFound(_))
     ));
-    store.compact_orphans(&fx.id).unwrap();
+    compacted(&mut store, &fx, at(H + 2, 0));
     assert_eq!(texts(&store.records_in(H, &fx.id).unwrap()), vec!["r0"]);
 }
 
@@ -365,7 +377,7 @@ fn failed_append_leftovers_are_cut_on_next_append() {
     drop(store);
 
     let mut store = fx.store();
-    store.compact_orphans(&fx.id).unwrap();
+    compacted(&mut store, &fx, at(H + 2, 0));
     assert_eq!(texts(&store.records_in(H, &fx.id).unwrap()), vec!["a", "b"]);
 }
 
@@ -507,4 +519,153 @@ fn stale_temp_files_are_removed_on_open() {
 fn store_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SegmentStore>();
+}
+
+#[test]
+fn compact_keeps_hours_within_grace_open() {
+    let fx = Fixture::new();
+    let mut first = fx.store();
+    append_at(&mut first, at(H, 58), "late");
+    append_at(&mut first, at(H + 1, 1), "early");
+    drop(first);
+
+    let mut store = fx.store();
+    let now = at(H + 1, 2);
+    let mut compacted_hours = compacted(&mut store, &fx, now);
+    compacted_hours.sort();
+    assert_eq!(compacted_hours, vec![H, H + 1]);
+    assert!(store.hours().unwrap().iter().all(|info| !info.sealed));
+    assert_eq!(store.forget_since(now - 5 * 60_000).unwrap(), 2);
+    let (next, _) = append_at(&mut store, at(H + 1, 3), "next");
+    assert_eq!(next.hour, H + 1);
+    assert_eq!(store.read(next, None).unwrap().text, "next");
+    assert!(store.records_in(H, &fx.id).unwrap().is_empty());
+    assert_eq!(
+        texts(&store.records_in(H + 1, &fx.id).unwrap()),
+        vec!["next"]
+    );
+}
+
+#[test]
+fn compact_absorbed_hour_seals_later() {
+    let fx = Fixture::new();
+    let mut first = fx.store();
+    let (a, _) = append_at(&mut first, at(H, 58), "a");
+    drop(first);
+    let mut store = fx.store();
+    assert_eq!(compacted(&mut store, &fx, at(H + 1, 2)), vec![H]);
+    assert_eq!(store.read(a, None).unwrap().text, "a");
+    assert_eq!(store.seal_due(at(H + 2, 0), GRACE).unwrap(), vec![H]);
+    assert_eq!(fx.file_names(), vec![format!("{H}.seg")]);
+    assert_eq!(store.read(a, Some(&fx.id)).unwrap().text, "a");
+}
+
+#[test]
+fn far_future_ts_does_not_pin_the_bucket() {
+    let fx = Fixture::new();
+    let mut store = fx.store();
+    let future = rec(i64::MAX, "future");
+    let r = store.append(&future, at(H, 1)).unwrap();
+    assert_eq!(r.hour, H);
+    assert_eq!(store.read(r, None).unwrap().ts, i64::MAX);
+    let (next, _) = append_at(&mut store, at(H + 1, 1), "next");
+    assert_eq!(next.hour, H + 1);
+    assert_eq!(store.seal_due(at(H + 1, 30), GRACE).unwrap(), vec![H]);
+    assert_eq!(store.read(r, Some(&fx.id)).unwrap().ts, i64::MAX);
+}
+
+#[test]
+fn bad_orphan_is_quarantined_and_others_compact() {
+    let fx = Fixture::new();
+    let mut first = fx.store();
+    let (good, _) = append_at(&mut first, at(H, 1), "good");
+    let (lost, _) = append_at(&mut first, at(H + 1, 1), "lost");
+    drop(first);
+    let bad_path = fx.dir.join(format!("{}.open", H + 1));
+    let mut bytes = fs::read(&bad_path).unwrap();
+    bytes[20] ^= 0xff;
+    fs::write(&bad_path, bytes).unwrap();
+
+    let mut store = fx.store();
+    let report = store.compact_orphans(&fx.id, at(H + 3, 0), GRACE).unwrap();
+    assert_eq!(report.compacted, vec![H]);
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(report.quarantined.len(), 1);
+    let quarantined = &report.quarantined[0].0;
+    assert_eq!(
+        quarantined.file_name().unwrap().to_str().unwrap(),
+        format!("{}.open.bad", H + 1)
+    );
+    assert_eq!(store.read(good, Some(&fx.id)).unwrap().text, "good");
+    assert!(matches!(
+        store.read(lost, Some(&fx.id)),
+        Err(VaultError::NotFound(_))
+    ));
+    assert_eq!(store.hours().unwrap().len(), 1);
+
+    let report = store.compact_orphans(&fx.id, at(H + 3, 0), GRACE).unwrap();
+    assert!(report.compacted.is_empty() && report.quarantined.is_empty());
+    store.remove_hour(H + 1).unwrap();
+    assert_eq!(fx.file_names(), vec![format!("{H}.seg")]);
+}
+
+#[test]
+fn corrupt_middle_frame_quarantines_only_that_file() {
+    let fx = Fixture::new();
+    let mut first = fx.store();
+    append_at(&mut first, at(H, 1), "r0");
+    append_at(&mut first, at(H, 2), "r1");
+    drop(first);
+    let mut second = fx.store();
+    let (kept, _) = append_at(&mut second, at(H, 3), "kept");
+    drop(second);
+    let broken = fx.dir.join(format!("{H}.open"));
+    let mut bytes = fs::read(&broken).unwrap();
+    let first_frame = open_file::scan(&broken).unwrap().frames[0];
+    bytes[first_frame.offset as usize + 40] ^= 1;
+    fs::write(&broken, bytes).unwrap();
+
+    let mut store = fx.store();
+    let report = store.compact_orphans(&fx.id, at(H + 3, 0), GRACE).unwrap();
+    assert_eq!(report.compacted, vec![H]);
+    assert_eq!(report.quarantined.len(), 1);
+    assert_eq!(texts(&store.records_in(H, &fx.id).unwrap()), vec!["kept"]);
+    assert_eq!(store.read(kept, Some(&fx.id)).unwrap().text, "kept");
+}
+
+#[test]
+fn file_times_show_only_the_hour() {
+    let fx = Fixture::new();
+    let mut store = fx.store();
+    append_at(&mut store, at(H, 42), "a");
+    let hour_start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(H) * 3600);
+    assert_eq!(mtime(&fx.dir.join(format!("{H}.open"))), hour_start);
+    append_at(&mut store, at(H, 43), "b");
+    store.forget_since(at(H, 43)).unwrap();
+    assert_eq!(mtime(&fx.dir.join(format!("{H}.open"))), hour_start);
+    store.seal_due(at(H + 2, 0), GRACE).unwrap();
+    assert_eq!(mtime(&fx.dir.join(format!("{H}.seg"))), hour_start);
+}
+
+#[test]
+fn hostile_sealed_length_is_corrupt_not_panic() {
+    let fx = Fixture::new();
+    let mut store = fx.store();
+    let (r, _) = append_at(&mut store, at(H, 1), "r");
+    store.seal_due(at(H + 2, 0), GRACE).unwrap();
+    let seg = fx.dir.join(format!("{H}.seg"));
+    let original = fs::read(&seg).unwrap();
+    let blob_len = u32::from_be_bytes(original[9..13].try_into().unwrap()) as usize;
+    let len_at = 13 + blob_len;
+    let real_len = u64::from_be_bytes(original[len_at..len_at + 8].try_into().unwrap());
+    for claimed in [u64::MAX, u64::MAX - 7, 1 << 50, real_len + 1, 7] {
+        let mut bytes = original.clone();
+        bytes[len_at..len_at + 8].copy_from_slice(&claimed.to_be_bytes());
+        fs::write(&seg, bytes).unwrap();
+        let store = fx.store();
+        assert!(matches!(
+            store.read(r, Some(&fx.id)),
+            Err(VaultError::Corrupt(_))
+        ));
+    }
 }

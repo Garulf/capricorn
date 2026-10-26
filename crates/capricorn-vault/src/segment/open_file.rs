@@ -1,7 +1,8 @@
 //! Open segment file: `b"CAPSEG-O1"`, u32 BE length, sealed hour key, then frames
 //! `[u32 BE ciphertext len][u32 BE seq][24 B nonce][ciphertext]`. Each frame is
 //! XChaCha20-Poly1305 under the hour key with AAD `hour BE || seq BE`. The seq is in the
-//! clear so frames can be counted, deleted and copied without the key.
+//! clear so frames can be counted, deleted and copied without the key. Until the hour is
+//! sealed, the file reveals each record's ciphertext size and the record count.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -13,7 +14,7 @@ use zeroize::Zeroizing;
 
 use super::format::{
     HourKey, commit_temp, corrupt, key_header_len, new_temp, random_key, read_key_header, read_u32,
-    seal_key, unseal_key, write_key_header,
+    seal_key, stamp_hour, unseal_key, write_key_header,
 };
 use crate::keyfile::{Identity, Recipient, Result};
 
@@ -58,7 +59,7 @@ pub(super) fn create(path: &Path, hour: u32, recipient: &Recipient) -> Result<(H
     let sealed_key = seal_key(recipient, &key, hour)?;
     let mut temp = new_temp(parent(path), hour)?;
     let header_len = write_key_header(&mut temp, MAGIC, &sealed_key)?;
-    commit_temp(temp, path)?;
+    commit_temp(temp, path, hour)?;
     Ok((key, header_len))
 }
 
@@ -110,14 +111,18 @@ pub(super) fn seal_frame(key: &HourKey, hour: u32, seq: u32, plaintext: &[u8]) -
     Ok(frame)
 }
 
-/// Appends at `end`, first cutting off anything a failed earlier append left behind.
-pub(super) fn append_frame(path: &Path, end: u64, frame: &[u8]) -> Result<()> {
+/// Appends at `end`, first cutting off anything a failed earlier append left behind, and
+/// resets the file times to the hour start.
+pub(super) fn append_frame(path: &Path, hour: u32, end: u64, frame: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new().write(true).open(path)?;
     if file.metadata()?.len() != end {
         file.set_len(end)?;
     }
     file.seek(SeekFrom::Start(end))?;
-    let written = file.write_all(frame).and_then(|()| file.sync_data());
+    let written = file
+        .write_all(frame)
+        .and_then(|()| stamp_hour(&file, hour))
+        .and_then(|()| file.sync_data());
     if written.is_err() {
         let _ = file.set_len(end);
     }
@@ -179,7 +184,7 @@ pub(super) fn rewrite_keeping(
         kept.push(Frame { offset, ..frame });
         offset += frame.len;
     }
-    commit_temp(temp, path)?;
+    commit_temp(temp, path, hour)?;
     Ok(kept)
 }
 

@@ -28,6 +28,7 @@ pub(super) struct SealedWriter {
     table: Vec<(u32, u64, u64)>,
     position: u64,
     dest: PathBuf,
+    hour: u32,
 }
 
 impl SealedWriter {
@@ -44,6 +45,7 @@ impl SealedWriter {
             table: Vec::new(),
             position: 0,
             dest: sealed_path(dir, hour),
+            hour,
         })
     }
 
@@ -68,7 +70,7 @@ impl SealedWriter {
             .map_err(|e| e.into_error())?;
         temp.seek(SeekFrom::Start(self.plain_len_at))?;
         temp.write_all(&plain_len.to_be_bytes())?;
-        commit_temp(temp, &self.dest)
+        commit_temp(temp, &self.dest, self.hour)
     }
 }
 
@@ -108,8 +110,10 @@ impl SealedFile {
         let body_plain_len =
             read_u64(&mut reader).map_err(|_| corrupt("segment header truncated"))?;
         let body_start = key_header_len(MAGIC, &sealed_key) + 8;
+        let expected_len = sealed_len(body_plain_len).and_then(|len| len.checked_add(body_start));
         if body_plain_len < TABLE_OFFSET_LEN
-            || body_start.checked_add(sealed_len(body_plain_len)) != Some(file_len)
+            || body_plain_len > file_len
+            || expected_len != Some(file_len)
         {
             return Err(corrupt("sealed segment length mismatch"));
         }
