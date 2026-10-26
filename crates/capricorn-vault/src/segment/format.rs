@@ -21,6 +21,7 @@ const SEALED_SUFFIX: &str = ".seg";
 const OPEN_SUFFIX: &str = ".open";
 const TEMP_SUFFIX: &str = ".tmp";
 const QUARANTINE_SUFFIX: &str = ".bad";
+const FLOOR_SUFFIX: &str = ".floor";
 
 /// Hour bucket (unix seconds / 3600) of a millisecond timestamp.
 pub fn hour_of(ts: Ts) -> u32 {
@@ -170,6 +171,34 @@ pub(super) fn list_files(dir: &Path) -> Result<Vec<SegFile>> {
     Ok(files)
 }
 
+pub(super) fn floor_path(dir: &Path, hour: u32) -> PathBuf {
+    dir.join(format!("{hour}{FLOOR_SUFFIX}"))
+}
+
+/// The lowest seq `hour` may still hand out. Records removed from an unsealed hour take
+/// their seqs with them, so this file remembers how far the hour got; without it a new
+/// open file could reuse the seq of a forgotten record that an older index still names.
+/// It reveals at most how many records the hour once had, which its `.open` file
+/// already did.
+pub(super) fn read_floor(dir: &Path, hour: u32) -> Result<u32> {
+    match fs::read(floor_path(dir, hour)) {
+        Ok(bytes) => <[u8; 4]>::try_from(bytes.as_slice())
+            .map(u32::from_be_bytes)
+            .map_err(|_| corrupt("seq floor file is malformed")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(super) fn raise_floor(dir: &Path, hour: u32, next: u32) -> Result<()> {
+    if read_floor(dir, hour)? >= next {
+        return Ok(());
+    }
+    let mut temp = new_temp(dir, hour)?;
+    temp.write_all(&next.to_be_bytes())?;
+    commit_temp(temp, &floor_path(dir, hour), hour)
+}
+
 /// Leftovers of rewrites interrupted by a crash. They only ever hold ciphertext.
 pub(super) fn remove_stale_temps(dir: &Path) -> Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -264,6 +293,7 @@ mod tests {
         assert_eq!(parse_name("12.ab.tmp"), None);
         assert_eq!(parse_name("x.seg"), None);
         assert_eq!(parse_name("vault.json"), None);
+        assert_eq!(parse_name("12.floor"), None);
     }
 
     #[test]

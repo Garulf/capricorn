@@ -153,7 +153,7 @@ fn forget_since_removes_recent_only() {
     let (a, _) = append_at(&mut store, at(H, 10), "a");
     let (b, _) = append_at(&mut store, at(H, 20), "b");
     let (c, _) = append_at(&mut store, at(H, 30), "c");
-    assert_eq!(store.forget_since(at(H, 25)).unwrap(), 1);
+    assert_eq!(store.forget_since(at(H, 25)).unwrap(), vec![c]);
     assert_eq!(store.read(a, None).unwrap().text, "a");
     assert_eq!(store.read(b, None).unwrap().text, "b");
     assert!(matches!(
@@ -182,7 +182,7 @@ fn forget_reaches_previous_hour_within_grace() {
     let (next, _) = append_at(&mut store, at(H + 1, 2), "next");
     assert_eq!(next.hour, H + 1);
     assert!(store.seal_due(at(H + 1, 3), GRACE).unwrap().is_empty());
-    assert_eq!(store.forget_since(at(H, 58)).unwrap(), 2);
+    assert_eq!(store.forget_since(at(H, 58)).unwrap(), vec![late, next]);
     assert!(store.read(late, Some(&fx.id)).is_err());
     assert!(store.read(next, Some(&fx.id)).is_err());
     assert_eq!(store.read(kept, None).unwrap().text, "kept");
@@ -271,8 +271,11 @@ fn forget_deletes_orphans_that_could_overlap() {
     drop(first);
 
     let mut store = fx.store();
-    assert_eq!(store.forget_since(at(H, 55)).unwrap(), 2);
-    assert_eq!(fx.file_names(), vec![format!("{}.open", H - 3)]);
+    assert_eq!(store.forget_since(at(H, 55)).unwrap().len(), 2);
+    assert_eq!(
+        fx.file_names(),
+        vec![format!("{}.open", H - 3), format!("{H}.floor")]
+    );
 }
 
 #[test]
@@ -535,7 +538,7 @@ fn compact_keeps_hours_within_grace_open() {
     compacted_hours.sort();
     assert_eq!(compacted_hours, vec![H, H + 1]);
     assert!(store.hours().unwrap().iter().all(|info| !info.sealed));
-    assert_eq!(store.forget_since(now - 5 * 60_000).unwrap(), 2);
+    assert_eq!(store.forget_since(now - 5 * 60_000).unwrap().len(), 2);
     let (next, _) = append_at(&mut store, at(H + 1, 3), "next");
     assert_eq!(next.hour, H + 1);
     assert_eq!(store.read(next, None).unwrap().text, "next");
@@ -668,4 +671,65 @@ fn hostile_sealed_length_is_corrupt_not_panic() {
             Err(VaultError::Corrupt(_))
         ));
     }
+}
+
+#[test]
+fn forgotten_orphan_seqs_are_not_reused() {
+    let fx = Fixture::new();
+    let mut first = fx.store();
+    for minute in 1..=3 {
+        append_at(&mut first, at(H, minute), "old");
+    }
+    drop(first);
+
+    let mut store = fx.store();
+    let forgotten = store.forget_since(at(H, 0)).unwrap();
+    assert_eq!(forgotten.len(), 3);
+    let (fresh, _) = append_at(&mut store, at(H, 10), "fresh");
+    assert_eq!(fresh.seq, 3);
+    drop(store);
+
+    let mut again = fx.store();
+    let (later, _) = append_at(&mut again, at(H, 11), "later");
+    assert_eq!(later.seq, 4);
+}
+
+#[test]
+fn forgotten_live_seqs_are_not_reused_after_restart() {
+    let fx = Fixture::new();
+    let mut first = fx.store();
+    append_at(&mut first, at(H, 1), "kept");
+    append_at(&mut first, at(H, 2), "gone");
+    append_at(&mut first, at(H, 3), "gone too");
+    assert_eq!(first.forget_since(at(H, 2)).unwrap().len(), 2);
+    assert_eq!(first.next_seq(H), Some(3));
+    assert_eq!(first.next_seq(H + 1), None);
+    drop(first);
+
+    let mut store = fx.store();
+    let (fresh, _) = append_at(&mut store, at(H, 10), "fresh");
+    assert_eq!(fresh.seq, 3);
+    compacted(&mut store, &fx, at(H, 11));
+    let refs: Vec<u32> = store
+        .records_in(H, &fx.id)
+        .unwrap()
+        .into_iter()
+        .map(|(r, _)| r.seq)
+        .collect();
+    assert_eq!(refs, vec![0, 3]);
+    store.remove_hour(H).unwrap();
+    assert!(!fx.file_names().iter().any(|name| name.ends_with(".floor")));
+}
+
+#[test]
+fn unscannable_sibling_is_quarantined_not_reused() {
+    let fx = Fixture::new();
+    let mut first = fx.store();
+    append_at(&mut first, at(H, 1), "a");
+    drop(first);
+    fs::write(fx.dir.join(format!("{H}.open")), b"garbage").unwrap();
+
+    let mut store = fx.store();
+    append_at(&mut store, at(H, 2), "b");
+    assert!(fx.file_names().contains(&format!("{H}.open.bad")));
 }

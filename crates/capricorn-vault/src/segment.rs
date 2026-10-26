@@ -19,8 +19,8 @@ use zeroize::Zeroizing;
 
 use crate::keyfile::{Identity, Recipient, Result, VaultError};
 use format::{
-    FileKind, HourKey, SegFile, corrupt, list_files, open_path, quarantine, quarantined_files,
-    remove_durably, remove_stale_temps, sealed_path,
+    FileKind, HourKey, SegFile, corrupt, floor_path, list_files, open_path, quarantine,
+    quarantined_files, raise_floor, read_floor, remove_durably, remove_stale_temps, sealed_path,
 };
 pub use format::{HOUR_MS, hour_end_ms, hour_of, hour_start_ms};
 use open_file::Frame;
@@ -108,16 +108,30 @@ impl SegmentStore {
         Ok(RecordRef { hour, seq })
     }
 
+    /// The seq the next append to `hour` gets, if this process has the hour open.
+    /// Higher than every seq the hour ever used, including forgotten ones.
+    pub fn next_seq(&self, hour: u32) -> Option<u32> {
+        self.live.get(&hour).map(|segment| segment.next_seq)
+    }
+
     /// Removes records with `max(ts, append time) >= since` from the open hours and
-    /// deletes orphans that could hold such records. Returns how many records were removed.
-    pub fn forget_since(&mut self, since: Ts) -> Result<u32> {
-        let mut removed = 0;
+    /// deletes orphans that could hold such records. Returns the refs removed; an orphan
+    /// too damaged to list its seqs is deleted without contributing any.
+    pub fn forget_since(&mut self, since: Ts) -> Result<Vec<RecordRef>> {
+        let mut removed = Vec::new();
         for segment in self.live.values_mut() {
-            removed += segment.retain(|frame| frame.ts < since)?;
+            let hour = segment.hour;
+            let seqs = segment.retain(&self.dir, |frame| frame.ts < since)?;
+            removed.extend(seqs.into_iter().map(|seq| RecordRef { hour, seq }));
         }
         for orphan in self.orphans()? {
             if hour_end_ms(orphan.hour) > since {
-                removed += open_file::scan(&orphan.path).map_or(0, |scan| scan.frames.len() as u32);
+                if let Ok(scan) = open_file::scan(&orphan.path) {
+                    let seqs: Vec<u32> = scan.frames.iter().map(|frame| frame.seq).collect();
+                    raise_floor_above(&self.dir, orphan.hour, &seqs)?;
+                    let hour = orphan.hour;
+                    removed.extend(seqs.into_iter().map(|seq| RecordRef { hour, seq }));
+                }
                 remove_durably(&orphan.path)?;
             }
         }
@@ -233,11 +247,13 @@ impl SegmentStore {
     pub fn delete_records(&mut self, hour: u32, seqs: &[u32], id: &Identity) -> Result<()> {
         let doomed = |seq: u32| seqs.contains(&seq);
         if let Some(segment) = self.live.get_mut(&hour) {
-            segment.retain(|frame| !doomed(frame.frame.seq))?;
+            segment.retain(&self.dir, |frame| !doomed(frame.frame.seq))?;
         }
         for orphan in self.orphans_of(hour)? {
             let scan = open_file::scan(&orphan.path)?;
             if scan.frames.iter().any(|frame| doomed(frame.seq)) {
+                let seqs: Vec<u32> = scan.frames.iter().map(|frame| frame.seq).collect();
+                raise_floor_above(&self.dir, hour, &seqs)?;
                 open_file::rewrite_keeping(
                     &orphan.path,
                     hour,
@@ -287,6 +303,7 @@ impl SegmentStore {
         for path in quarantined_files(&self.dir, hour)? {
             remove_durably(&path)?;
         }
+        remove_durably(&floor_path(&self.dir, hour))?;
         self.forget_table(hour);
         Ok(())
     }
@@ -394,6 +411,7 @@ impl SegmentStore {
     fn seal_live(&self, segment: &LiveSegment) -> Result<bool> {
         if segment.frames.is_empty() {
             remove_durably(&segment.path)?;
+            self.drop_floor_if_hour_is_gone(segment.hour)?;
             return Ok(false);
         }
         if sealed_path(&self.dir, segment.hour).exists() {
@@ -407,11 +425,20 @@ impl SegmentStore {
         Ok(true)
     }
 
+    /// A past hour without files never allocates again, so its floor has no use left.
+    fn drop_floor_if_hour_is_gone(&self, hour: u32) -> Result<()> {
+        if list_files(&self.dir)?.iter().any(|file| file.hour == hour) {
+            return Ok(());
+        }
+        remove_durably(&floor_path(&self.dir, hour))
+    }
+
     fn seal_orphans(&self, hour: u32, orphans: &[SegFile], id: &Identity) -> Result<()> {
         let scans = scan_all(orphans)?;
         let existing = self.open_sealed(hour, id)?;
         let existing_seqs = existing.iter().flat_map(|(_, table)| table.seqs());
         let mut placer = SeqPlacer::above(existing_seqs.chain(frame_seqs(&scans)));
+        placer.next_free = placer.next_free.max(read_floor(&self.dir, hour)?);
         let mut writer = SealedWriter::create(&self.dir, hour, &self.recipient)?;
         let mut written = 0usize;
         let mut add = |seq: u32, bytes: Zeroizing<Vec<u8>>| -> Result<()> {
@@ -543,16 +570,24 @@ struct LiveFrame {
 }
 
 impl LiveSegment {
-    /// Starts a new file next to the hour's orphans, with seqs above all of theirs.
+    /// Starts a new file next to the hour's orphans, with seqs above all of theirs and
+    /// above the hour's floor. A sibling whose seqs cannot be listed is quarantined, as
+    /// compaction would do, rather than guessed around.
     fn create(dir: &Path, hour: u32, recipient: &Recipient, siblings: &[SegFile]) -> Result<Self> {
         let taken: HashSet<FileKind> = siblings.iter().map(|file| file.kind).collect();
         let suffix = (0..)
             .find(|&suffix| !taken.contains(&FileKind::Open { suffix }))
             .expect("a free suffix exists");
-        let scans: Vec<_> = siblings
-            .iter()
-            .filter_map(|file| open_file::scan(&file.path).ok())
-            .collect();
+        let mut scans = Vec::new();
+        for file in siblings {
+            match open_file::scan(&file.path) {
+                Ok(scan) => scans.push(scan),
+                Err(_) => {
+                    quarantine(&file.path)?;
+                }
+            }
+        }
+        let floor = read_floor(dir, hour)?;
         let path = open_path(dir, hour, suffix);
         let (key, header_len) = open_file::create(&path, hour, recipient)?;
         Ok(Self {
@@ -561,7 +596,7 @@ impl LiveSegment {
             key,
             header_len,
             frames: Vec::new(),
-            next_seq: SeqPlacer::above(frame_seqs(&scans)).next_free,
+            next_seq: SeqPlacer::above(frame_seqs(&scans)).next_free.max(floor),
         })
     }
 
@@ -617,18 +652,25 @@ impl LiveSegment {
         open_file::for_each_record(&self.path, &self.key, self.hour, &frames, false, visit)
     }
 
-    /// Rewrites the file without the frames `keep` rejects. Returns how many were dropped.
-    fn retain(&mut self, keep: impl Fn(&LiveFrame) -> bool) -> Result<u32> {
+    /// Rewrites the file without the frames `keep` rejects, first recording the hour's
+    /// floor in `dir`. Returns the dropped seqs.
+    fn retain(&mut self, dir: &Path, keep: impl Fn(&LiveFrame) -> bool) -> Result<Vec<u32>> {
         let kept: HashMap<u32, Ts> = self
             .frames
             .iter()
             .filter(|live| keep(live))
             .map(|live| (live.frame.seq, live.ts))
             .collect();
-        let dropped = self.frames.len() - kept.len();
-        if dropped == 0 {
-            return Ok(0);
+        let dropped: Vec<u32> = self
+            .frames
+            .iter()
+            .map(|live| live.frame.seq)
+            .filter(|seq| !kept.contains_key(seq))
+            .collect();
+        if dropped.is_empty() {
+            return Ok(dropped);
         }
+        raise_floor(dir, self.hour, self.next_seq)?;
         let moved = open_file::rewrite_keeping(
             &self.path,
             self.hour,
@@ -643,7 +685,7 @@ impl LiveSegment {
                 frame,
             })
             .collect();
-        Ok(dropped as u32)
+        Ok(dropped)
     }
 }
 
@@ -681,6 +723,13 @@ impl SeqPlacer {
         self.by_seq.insert(placed_seq, digest);
         self.placed.insert(digest);
         Some(placed_seq)
+    }
+}
+
+fn raise_floor_above(dir: &Path, hour: u32, seqs: &[u32]) -> Result<()> {
+    match seqs.iter().max() {
+        Some(max) => raise_floor(dir, hour, max.saturating_add(1)),
+        None => Ok(()),
     }
 }
 
