@@ -35,7 +35,7 @@ let
   swapIsSafe = lib.all (
     swap: swap.randomEncryption.enable or false || lib.hasPrefix "/dev/mapper/" (swap.device or "")
   ) config.swapDevices;
-  coredumpsOff = lib.hasInfix "Storage=none" config.systemd.coredump.extraConfig;
+  coredumpsOff = (config.systemd.coredump.settings.Coredump.Storage or null) == "none";
   hibernationSafe =
     config.boot.resumeDevice == "" || lib.hasPrefix "/dev/mapper/" config.boot.resumeDevice;
 in
@@ -118,7 +118,7 @@ in
       }
       {
         assertion = coredumpsOff;
-        message = "services.capricorn: systemd.coredump.extraConfig must contain Storage=none (or set services.capricorn.allowInsecureHost).";
+        message = "services.capricorn: systemd.coredump.settings.Coredump.Storage must be \"none\" (or set services.capricorn.allowInsecureHost).";
       }
     ];
 
@@ -126,7 +126,7 @@ in
       config.boot.initrd.luks.devices == { }
     ) "services.capricorn: no LUKS devices configured; full-disk encryption is strongly recommended.";
 
-    systemd.coredump.extraConfig = lib.mkDefault "Storage=none";
+    systemd.coredump.settings.Coredump.Storage = lib.mkDefault "none";
     boot.kernel.sysctl."kernel.yama.ptrace_scope" = lib.mkDefault cfg.ptraceScope;
 
     users.groups.capricorn = { };
