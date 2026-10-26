@@ -29,6 +29,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 rand = "0.9"
+age = "0.12"
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
 
 [profile.release]
 lto = "thin"
