@@ -7,6 +7,10 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -14,10 +18,24 @@
       self,
       nixpkgs,
       home-manager,
+      rust-overlay,
     }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+
+      # nixpkgs' rustc is built against a newer system LLVM than its stdarch
+      # expects, which breaks rten-gemm's AVX-512 kernels; the upstream
+      # toolchain ships its own LLVM.
+      rustPlatformFor =
+        pkgs:
+        let
+          toolchain = (pkgs.extend rust-overlay.overlays.default).rust-bin.stable."1.99.1".minimal;
+        in
+        pkgs.makeRustPlatform {
+          cargo = toolchain;
+          rustc = toolchain;
+        };
 
       hmEval =
         pkgs: configType:
@@ -54,7 +72,7 @@
     in
     {
       packages = forAllSystems (pkgs: {
-        default = pkgs.callPackage ./nix/package.nix { };
+        default = pkgs.callPackage ./nix/package.nix { rustPlatform = rustPlatformFor pkgs; };
       });
 
       nixosModules.default = import ./nix/nixos-module.nix self;
