@@ -1,0 +1,39 @@
+[
+  {
+    "address": "0x55d0a1f2b3c0",
+    "mapped": true,
+    "hidden": false,
+    "at": [0, 0],
+    "size": [1920, 1080],
+    "workspace": {"id": 2, "name": "2"},
+    "floating": false,
+    "monitor": 0,
+    "class": "mpv",
+    "title": "video.mkv - mpv",
+    "initialClass": "mpv",
+    "initialTitle": "mpv",
+    "pid": 777,
+    "xwayland": false,
+    "pinned": false,
+    "fullscreen": true,
+    "fullscreenMode": 0,
+    "fakeFullscreen": false,
+    "grouped": [],
+    "swallowing": "0x0",
+    "focusHistoryID": 0
+  },
+  {
+    "address": "0x55d0a1f2c000",
+    "mapped": true,
+    "hidden": false,
+    "at": [10, 10],
+    "size": [600, 400],
+    "workspace": {"id": 2, "name": "2"},
+    "monitor": 0,
+    "class": "foot",
+    "title": "foot",
+    "pid": 778,
+    "fullscreen": false,
+    "someFutureField": {"nested": [1, 2, 3]}
+  }
+]
