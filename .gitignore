@@ -3,3 +3,4 @@
 /result-*
 *.swp
 .superpowers/
+crates/*/target/
