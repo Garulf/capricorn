@@ -1,20 +1,28 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    ActiveWindow { class: String, title: String },
+    ActiveWindow {
+        class: String,
+        title: String,
+    },
     Workspace(String),
-    FocusedMon { mon: String, ws: String },
+    FocusedMon {
+        mon: String,
+        ws: String,
+    },
     OpenWindow,
     CloseWindow,
     MoveWindow,
     WindowTitle,
     Fullscreen(bool),
+    /// A `v2` twin of an event Hyprland also sends unversioned.
+    Versioned,
     Other,
 }
 
 /// Parses one `EVENT>>DATA` line from socket2.
 ///
 /// Only the unversioned events are mapped; their `v2` twins are emitted for
-/// the same occurrence and would double every event.
+/// the same occurrence and would double every event, so they become `Versioned`.
 pub fn parse_event(line: &str) -> Event {
     let line = line.trim_end_matches(['\n', '\r']);
     let Some((name, data)) = line.split_once(">>") else {
@@ -41,6 +49,7 @@ pub fn parse_event(line: &str) -> Event {
         "closewindow" => Event::CloseWindow,
         "movewindow" => Event::MoveWindow,
         "windowtitle" => Event::WindowTitle,
+        _ if name.ends_with("v2") => Event::Versioned,
         _ => Event::Other,
     }
 }
@@ -112,10 +121,15 @@ mod tests {
     }
 
     #[test]
-    fn versioned_duplicates_are_other() {
-        assert_eq!(parse_event("workspacev2>>3,3"), Event::Other);
-        assert_eq!(parse_event("activewindowv2>>80a6f50"), Event::Other);
-        assert_eq!(parse_event("windowtitlev2>>80a6f50,t"), Event::Other);
+    fn versioned_duplicates_are_marked() {
+        assert_eq!(parse_event("workspacev2>>3,3"), Event::Versioned);
+        assert_eq!(parse_event("activewindowv2>>80a6f50"), Event::Versioned);
+        assert_eq!(parse_event("windowtitlev2>>80a6f50,t"), Event::Versioned);
+        assert_eq!(
+            parse_event("activespecialv2>>-98,special:a,DP-1"),
+            Event::Versioned
+        );
+        assert_eq!(parse_event("activespecial>>special:a,DP-1"), Event::Other);
     }
 
     #[test]
