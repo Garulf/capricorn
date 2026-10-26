@@ -58,7 +58,7 @@ rustPlatform.buildRustPackage {
   '';
 
   # The UI dlopens Wayland, xkbcommon and GPU libraries. An rpath keeps the
-  # binary at its own store path, which the daemon checks as a peer identity.
+  # binary at its own store path instead of behind a wrapper script.
   postFixup = ''
     patchelf --add-rpath ${lib.makeLibraryPath uiRuntimeLibs} $out/bin/capricorn-ui
   '';

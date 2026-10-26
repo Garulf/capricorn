@@ -37,7 +37,10 @@ includes other programs running under your own login.
 - `capricorn-capture` runs as you, because it has to talk to your Wayland compositor. It
   holds no keys and writes nothing to disk. With the Home Manager module, Hyprland's
   permission system lets only this exact binary (matched by its full Nix store path) take
-  screenshots; everything else gets Hyprland's default prompt.
+  screenshots without a prompt. That keeps ordinary programs from silently grabbing the
+  screen, but it is not a wall against malware already running as you: such code can
+  start the allowed binary itself, under a debugger or with injected libraries, and read
+  what it captures. What it cannot do is read the history that is already stored.
 - `capricorn-ui` and the `capricorn` CLI run as you. A session is tied to one socket
   connection: unlocking on one connection does not unlock it for any other. The UI marks
   itself non-dumpable so other processes running as you can't read its memory through
