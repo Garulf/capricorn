@@ -21,6 +21,7 @@ use crate::exclude::{
 use crate::focus::{CLIPBOARD_LOOKBACK, FocusHistory, event_window_excluded};
 use crate::idle;
 use crate::link::{DaemonLink, LinkEvent};
+use crate::lock;
 use crate::scheduler::{Decision, Input, Scheduler};
 use crate::screencopy::capture_output;
 use crate::wl;
@@ -57,6 +58,7 @@ pub async fn run() -> anyhow::Result<()> {
     let (link_tx, link) = mpsc::unbounded_channel();
 
     let (settle, idle_after) = (settings.settle, settings.idle);
+    tokio::spawn(lock::watch(input_tx.clone()));
     let idle_conn = conn.clone();
     spawn_watcher("idle", died_tx.clone(), move || {
         idle::watch(&idle_conn, settle, idle_after, input_tx)

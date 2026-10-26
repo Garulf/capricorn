@@ -843,6 +843,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
+ "zbus 6.1.0",
 ]
 
 [[package]]

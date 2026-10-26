@@ -15,7 +15,7 @@ futures.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
 memmap2 = "0.9"
 regex.workspace = true
-rustix = { version = "1", features = ["fs", "pipe", "event"] }
+rustix = { version = "1", features = ["fs", "pipe", "event", "process"] }
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -24,6 +24,7 @@ tracing-subscriber.workspace = true
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+zbus = { version = "6", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tempfile.workspace = true

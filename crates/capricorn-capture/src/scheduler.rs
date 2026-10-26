@@ -16,10 +16,6 @@ pub enum Input {
     Active,
     /// No input for the idle duration.
     Idle,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "no session-lock source is wired up yet")
-    )]
     Locked(bool),
     Paused(bool),
     Fullscreen {

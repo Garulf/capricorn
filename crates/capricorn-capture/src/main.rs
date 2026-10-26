@@ -10,6 +10,7 @@ mod focus;
 mod idle;
 mod inject;
 mod link;
+mod lock;
 mod recorder;
 mod scheduler;
 mod screencopy;
