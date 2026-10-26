@@ -41,6 +41,10 @@ pub enum VaultError {
     Corrupt(String),
     #[error("crypto error: {0}")]
     Crypto(String),
+    #[error("vault is locked")]
+    Locked,
+    #[error("record {0} not found")]
+    NotFound(capricorn_core::proto::RecordRef),
 }
 
 pub type Result<T, E = VaultError> = std::result::Result<T, E>;
