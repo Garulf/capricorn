@@ -112,7 +112,7 @@ enum Launcher {
 }
 
 fn launcher_for(class: &str) -> Option<Launcher> {
-    use Launcher::{Browser, Terminal};
+    use Launcher::Terminal;
     let launcher = match class.to_ascii_lowercase().as_str() {
         "kitty" => Terminal {
             binary: "kitty",

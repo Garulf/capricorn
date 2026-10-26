@@ -1060,8 +1060,8 @@ async fn connections_per_socket_are_capped() {
         let socket = daemon.runtime_dir.join("client.sock");
         async move {
             let mut stream = connect(&socket).await;
-            write_msg(&mut stream, &ClientReq::Status).await.unwrap();
-            read_msg::<_, ClientResp>(&mut stream).await.is_ok()
+            write_msg(&mut stream, &ClientReq::Status).await.is_ok()
+                && read_msg::<_, ClientResp>(&mut stream).await.is_ok()
         }
     })
     .await;

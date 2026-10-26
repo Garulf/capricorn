@@ -301,7 +301,8 @@ async fn status_follow_prints_first_state_then_waits() {
     let first = lines.next_line().await.unwrap().unwrap();
 
     let json: serde_json::Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(json["alt"], "locked");
+    assert_eq!(json["alt"], "recording");
+    assert_eq!(json["tooltip"], "recording, vault locked");
     child.kill().await.unwrap();
 }
 
