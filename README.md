@@ -80,7 +80,7 @@ capricorn status              # vault and recorder state
 capricorn search nix flake    # asks for the password, prints matches
 capricorn search --json --kind clipboard token
 capricorn forget 10           # drop the last 10 minutes
-capricorn pause / resume
+capricorn toggle              # pause, or resume when paused
 capricorn lock
 capricorn passwd
 ```
@@ -105,7 +105,9 @@ services.hypridle.settings.general.lock_cmd = "capricorn lock; pidof hyprlock ||
 }
 ```
 
-The module's `class` is one of `recording`, `paused`, `idle`, `locked` or `off`.
+The module shows the recorder, because recording goes on while the vault is locked. Its
+`class` is one of `recording`, `paused`, `idle`, `locked` (the screen is locked) or `off`
+(no daemon or no capture client). The tooltip says whether the vault is locked.
 
 ### Keeping things out
 

@@ -31,7 +31,7 @@ let
     search = "${cli} show search";
     timeline = "${cli} show timeline";
     lock = "${cli} lock";
-    pause = "${cli} pause";
+    pause = "${cli} toggle";
     forget = "${cli} forget";
   };
   boundActions = lib.filterAttrs (name: _: cfg.keybinds.${name} != null) actions;
