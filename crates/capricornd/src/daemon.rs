@@ -2,7 +2,7 @@
 //! work, so async callers go through `spawn_blocking`.
 //!
 //! Lock order, outermost first: `unlock_gate`, `ingest_gate`, `store`, `state`,
-//! `snapshot_gate`. `recorders`, `forgotten` and `failures` are leaf locks. Locking the
+//! `snapshot_gate`. `recorders`, `forgotten`, `paused` and `failures` are leaf locks. Locking the
 //! vault never takes `unlock_gate`, so a slow or flooded unlock cannot delay it.
 
 use std::collections::BTreeMap;
@@ -93,7 +93,8 @@ pub struct Daemon {
     /// Captures stamped inside this window were forgotten while still queued.
     forgotten: Mutex<Option<(Ts, Ts)>>,
     pending_index: AtomicU64,
-    paused: AtomicBool,
+    /// Held while the change is broadcast, so capture clients see changes in order.
+    paused: Mutex<bool>,
     epochs: AtomicU64,
     capture_ctl: broadcast::Sender<CaptureCtl>,
     catch_up_wanted: Notify,
@@ -138,7 +139,7 @@ impl Daemon {
             lock_epoch: AtomicU64::new(0),
             forgotten: Mutex::new(None),
             pending_index: AtomicU64::new(0),
-            paused: AtomicBool::new(false),
+            paused: Mutex::new(false),
             epochs: AtomicU64::new(0),
             capture_ctl: broadcast::channel(16).0,
             catch_up_wanted: Notify::new(),
@@ -149,11 +150,16 @@ impl Daemon {
         &self.cfg
     }
 
-    pub fn status(&self) -> Status {
+    pub fn status(&self, conn: ConnId) -> Status {
+        let (vault, session) = {
+            let state = lock(&self.state);
+            (state.describe(Instant::now()), state.has_session(conn))
+        };
         Status {
-            vault: lock(&self.state).describe(Instant::now()),
+            vault,
             recorder: lock(&self.recorders).last().and_then(|(_, state)| *state),
             pending_index: self.pending_index.load(Ordering::Relaxed),
+            session,
         }
     }
 
@@ -406,7 +412,7 @@ impl Daemon {
     }
 
     pub fn accepts_captures(&self) -> bool {
-        !self.paused.load(Ordering::Relaxed) && self.has_store.load(Ordering::Relaxed)
+        !self.is_paused() && self.has_store.load(Ordering::Relaxed)
     }
 
     pub fn capture_connected(&self, capture: u64) {
@@ -428,7 +434,19 @@ impl Daemon {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
+        let mut current = lock(&self.paused);
+        *current = paused;
+        self.announce_pause(paused);
+    }
+
+    /// Decides from the daemon's own flag, so two quick toggles cannot both pause.
+    pub fn toggle_paused(&self) {
+        let mut current = lock(&self.paused);
+        *current = !*current;
+        self.announce_pause(*current);
+    }
+
+    fn announce_pause(&self, paused: bool) {
         let ctl = if paused {
             CaptureCtl::Pause
         } else {
@@ -438,7 +456,7 @@ impl Daemon {
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed)
+        *lock(&self.paused)
     }
 
     pub fn subscribe_ctl(&self) -> broadcast::Receiver<CaptureCtl> {

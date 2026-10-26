@@ -42,6 +42,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Forget { minutes } => simple(ClientReq::Forget { minutes }).await,
         Command::Pause => simple(ClientReq::Pause).await,
         Command::Resume => simple(ClientReq::Resume).await,
+        Command::Toggle => simple(ClientReq::TogglePause).await,
         Command::Passwd { password } => passwd(password).await,
         Command::Show { view } => show(view).await,
         Command::Reopen { record, password } => reopen(record, password).await,

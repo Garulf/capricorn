@@ -47,9 +47,9 @@ fn snippet(hit: &Hit, color: bool) -> String {
     }
 }
 
-/// Captured text may contain terminal escapes. Controls become spaces of the same byte
-/// length so highlight offsets stay valid.
-fn printable(text: &str) -> String {
+/// Captured text, and errors that quote it or Hyprland, may contain terminal escapes.
+/// Controls become spaces of the same byte length so highlight offsets stay valid.
+pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control() {
@@ -207,6 +207,7 @@ mod tests {
             vault: VaultState::Unlocked { locks_in_secs: 90 },
             recorder: Some(RecorderState::Paused),
             pending_index: 3,
+            session: false,
         };
         assert_eq!(
             status_text(&status),

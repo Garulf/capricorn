@@ -66,6 +66,11 @@ impl VaultState {
             .filter(|unlocked| unlocked.sessions.contains(&conn))
     }
 
+    pub fn has_session(&self, conn: ConnId) -> bool {
+        self.unlocked()
+            .is_some_and(|unlocked| unlocked.sessions.contains(&conn))
+    }
+
     /// Replaces an unlocked state with a locked one and hands back what was unlocked.
     pub fn take_unlocked(&mut self) -> Option<Box<Unlocked>> {
         let vault = self.unlocked()?.vault.clone();

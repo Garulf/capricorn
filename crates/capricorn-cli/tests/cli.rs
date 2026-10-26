@@ -93,6 +93,7 @@ fn status(vault: VaultState) -> ClientResp {
         vault,
         recorder: Some(RecorderState::Recording),
         pending_index: 0,
+        session: false,
     })
 }
 
@@ -269,6 +270,18 @@ async fn waybar_status_reports_recording() {
 }
 
 #[tokio::test]
+async fn waybar_status_reports_recording_while_the_vault_is_locked() {
+    let env = Env::new();
+    env.start_daemon(|_| status(VaultState::Locked));
+
+    let out = env.run(&["status", "--waybar"], "").await;
+
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(json["class"], "recording");
+    assert_eq!(json["tooltip"], "recording, vault locked");
+}
+
+#[tokio::test]
 async fn plain_status_exits_3_when_daemon_is_down() {
     let env = Env::new();
     let out = env.run(&["status"], "").await;
@@ -288,7 +301,8 @@ async fn status_follow_prints_first_state_then_waits() {
     let first = lines.next_line().await.unwrap().unwrap();
 
     let json: serde_json::Value = serde_json::from_str(&first).unwrap();
-    assert_eq!(json["alt"], "locked");
+    assert_eq!(json["alt"], "recording");
+    assert_eq!(json["tooltip"], "recording, vault locked");
     child.kill().await.unwrap();
 }
 
@@ -394,12 +408,17 @@ async fn forget_defaults_to_five_minutes() {
 async fn pause_resume_lock_send_matching_requests() {
     let env = Env::new();
     env.start_daemon(|_| ClientResp::Ok);
-    for sub in ["pause", "resume", "lock"] {
+    for sub in ["pause", "resume", "toggle", "lock"] {
         assert!(env.run(&[sub], "").await.status.success(), "{sub}");
     }
     assert_eq!(
         env.requests(),
-        vec![ClientReq::Pause, ClientReq::Resume, ClientReq::Lock]
+        vec![
+            ClientReq::Pause,
+            ClientReq::Resume,
+            ClientReq::TogglePause,
+            ClientReq::Lock
+        ]
     );
 }
 
@@ -483,6 +502,44 @@ async fn reopen_unknown_app_without_desktop_file_fails() {
 
     assert_eq!(out.status.code(), Some(1));
     assert!(stderr(&out).contains("no-such-app-xyz"), "{}", stderr(&out));
+}
+
+#[tokio::test]
+async fn reopen_error_does_not_echo_terminal_escapes_from_the_record() {
+    let env = Env::new();
+    env.start_daemon(accepting_daemon("pw", |_| {
+        detail("evil\u{1b}]0;owned\u{7}", None)
+    }));
+    let mut cmd = env.command(&["reopen", "1:2", "--password-stdin"]);
+    cmd.env("HYPRLAND_INSTANCE_SIGNATURE", "sig_1_2")
+        .env("XDG_DATA_DIRS", env.xdg.path());
+
+    let out = run_with_stdin(cmd, "pw\n").await;
+
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("evil") && !err.contains(['\u{1b}', '\u{7}']),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn reopen_error_does_not_echo_terminal_escapes_from_hyprland() {
+    let env = Env::new();
+    env.start_daemon(accepting_daemon("pw", |req| match req {
+        ClientReq::Detail(_) => detail("kitty", None),
+        _ => ClientResp::Err("unexpected".into()),
+    }));
+    let _hypr = serve_hypr(env.xdg.path(), "bad\u{1b}[2Jcommand").await;
+    let mut cmd = env.command(&["reopen", "1:2", "--password-stdin"]);
+    cmd.env("HYPRLAND_INSTANCE_SIGNATURE", "sig_1_2");
+
+    let out = run_with_stdin(cmd, "pw\n").await;
+
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("bad") && !err.contains('\u{1b}'), "{err:?}");
 }
 
 #[tokio::test]

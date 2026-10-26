@@ -576,6 +576,29 @@ async fn other_connection_cannot_search_after_unlock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reports_whether_this_connection_holds_a_session() {
+    let root = TempDir::new().unwrap();
+    let ocr = Arc::new(FakeOcr::default());
+    let (daemon, mut ui) = initialized(test_config(root.path()), &ocr).await;
+    let mut cli = daemon.client().await;
+    assert!(!ui.status().await.session);
+
+    assert_eq!(ui.unlock(PASSWORD).await, ClientResp::Ok);
+    assert!(ui.status().await.session);
+    let other = cli.status().await;
+    assert!(matches!(other.vault, VaultState::Unlocked { .. }));
+    assert!(!other.session);
+
+    assert_eq!(cli.call(ClientReq::Lock).await, ClientResp::Ok);
+    assert_eq!(cli.unlock(PASSWORD).await, ClientResp::Ok);
+    let after = ui.status().await;
+    assert!(matches!(after.vault, VaultState::Unlocked { .. }));
+    assert!(!after.session, "a lock in between ended the UI's session");
+    assert!(cli.status().await.session);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wrong_password_delays_and_errors() {
     let root = TempDir::new().unwrap();
     let ocr = Arc::new(FakeOcr::default());
@@ -894,6 +917,11 @@ async fn pause_reaches_capture_client() {
     assert_eq!(ui.call(ClientReq::Resume).await, ClientResp::Ok);
     let ctl: CaptureCtl = read_msg(&mut capture.stream).await.unwrap();
     assert_eq!(ctl, CaptureCtl::Resume);
+    for expected in [CaptureCtl::Pause, CaptureCtl::Resume] {
+        assert_eq!(ui.call(ClientReq::TogglePause).await, ClientResp::Ok);
+        let ctl: CaptureCtl = read_msg(&mut capture.stream).await.unwrap();
+        assert_eq!(ctl, expected);
+    }
 
     let mut newer = daemon.capture(&ocr).await;
     newer
@@ -1032,8 +1060,8 @@ async fn connections_per_socket_are_capped() {
         let socket = daemon.runtime_dir.join("client.sock");
         async move {
             let mut stream = connect(&socket).await;
-            write_msg(&mut stream, &ClientReq::Status).await.unwrap();
-            read_msg::<_, ClientResp>(&mut stream).await.is_ok()
+            write_msg(&mut stream, &ClientReq::Status).await.is_ok()
+                && read_msg::<_, ClientResp>(&mut stream).await.is_ok()
         }
     })
     .await;

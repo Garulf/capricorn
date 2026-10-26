@@ -108,6 +108,7 @@ impl TimelineState {
             self.image = None;
             self.workspaces.clear();
             self.matches.clear();
+            self.app_filter = None;
             self.locks_in_secs = None;
         }
         self.gate = gate;

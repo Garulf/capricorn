@@ -1,32 +1,41 @@
 use capricorn_core::proto::{RecorderState, Status, VaultState};
 use serde_json::{Value, json};
 
+/// Recording goes on while the vault is locked, so the module shows the recorder and
+/// leaves the vault to the tooltip.
 pub fn waybar(status: &Status) -> Value {
-    let (alt, detail) = match status.vault {
-        VaultState::Uninitialized => ("off", "not set up, run `capricorn init`".to_owned()),
-        VaultState::Locked => ("locked", "vault locked".to_owned()),
-        VaultState::Unlocked { locks_in_secs } => unlocked_state(status, locks_in_secs),
-    };
-    let text = match status.vault {
-        VaultState::Uninitialized => "uninitialized",
-        _ => alt,
-    };
-    let tooltip = with_pending(detail, status.pending_index);
-    waybar_value(text, alt, &tooltip)
+    if status.vault == VaultState::Uninitialized {
+        let tooltip = with_pending(
+            "not set up, run `capricorn init`".to_owned(),
+            status.pending_index,
+        );
+        return waybar_value("uninitialized", "off", &tooltip);
+    }
+    let (alt, recorder) = recorder_state(status.recorder);
+    let detail = format!("{recorder}, {}", vault_detail(status.vault));
+    waybar_value(alt, alt, &with_pending(detail, status.pending_index))
 }
 
 pub fn waybar_unreachable() -> Value {
     waybar_value("off", "off", "capricornd is not running")
 }
 
-fn unlocked_state(status: &Status, locks_in_secs: u64) -> (&'static str, String) {
-    let locks = format!("locks in {}", format_duration(locks_in_secs));
-    match status.recorder {
-        Some(RecorderState::Recording) => ("recording", format!("recording, {locks}")),
-        Some(RecorderState::Paused) => ("paused", format!("paused, {locks}")),
-        Some(RecorderState::Idle) => ("idle", format!("idle, {locks}")),
-        Some(RecorderState::Locked) => ("locked", "recorder locked".to_owned()),
-        None => ("off", format!("no capture client connected, {locks}")),
+fn recorder_state(recorder: Option<RecorderState>) -> (&'static str, &'static str) {
+    match recorder {
+        Some(RecorderState::Recording) => ("recording", "recording"),
+        Some(RecorderState::Paused) => ("paused", "paused"),
+        Some(RecorderState::Idle) => ("idle", "idle"),
+        Some(RecorderState::Locked) => ("locked", "screen locked"),
+        None => ("off", "no capture client connected"),
+    }
+}
+
+fn vault_detail(vault: VaultState) -> String {
+    match vault {
+        VaultState::Unlocked { locks_in_secs } => {
+            format!("vault locks in {}", format_duration(locks_in_secs))
+        }
+        _ => "vault locked".to_owned(),
     }
 }
 
@@ -59,6 +68,7 @@ mod tests {
             vault,
             recorder,
             pending_index: 0,
+            session: false,
         }
     }
 
@@ -72,24 +82,34 @@ mod tests {
 
     #[test]
     fn waybar_json_states() {
+        for vault in [VaultState::Locked, UNLOCKED] {
+            for (recorder, class) in [
+                (Some(RecorderState::Recording), "recording"),
+                (Some(RecorderState::Paused), "paused"),
+                (Some(RecorderState::Idle), "idle"),
+                (Some(RecorderState::Locked), "locked"),
+                (None, "off"),
+            ] {
+                assert_eq!(
+                    alt_of(&status(vault, recorder)),
+                    class,
+                    "{vault:?} {recorder:?}"
+                );
+            }
+        }
         let recording = Some(RecorderState::Recording);
-        assert_eq!(alt_of(&status(VaultState::Uninitialized, None)), "off");
-        assert_eq!(alt_of(&status(VaultState::Locked, recording)), "locked");
-        assert_eq!(alt_of(&status(UNLOCKED, recording)), "recording");
-        assert_eq!(
-            alt_of(&status(UNLOCKED, Some(RecorderState::Paused))),
-            "paused"
-        );
-        assert_eq!(alt_of(&status(UNLOCKED, Some(RecorderState::Idle))), "idle");
-        assert_eq!(alt_of(&status(UNLOCKED, None)), "off");
+        assert_eq!(alt_of(&status(VaultState::Uninitialized, recording)), "off");
         assert_eq!(waybar_unreachable()["alt"], "off");
     }
 
     #[test]
-    fn text_names_the_state_and_tooltip_explains_it() {
+    fn text_names_the_recorder_and_tooltip_adds_the_vault() {
         let value = waybar(&status(UNLOCKED, Some(RecorderState::Recording)));
         assert_eq!(value["text"], "recording");
-        assert_eq!(value["tooltip"], "recording, locks in 14m");
+        assert_eq!(value["tooltip"], "recording, vault locks in 14m");
+        let locked = waybar(&status(VaultState::Locked, Some(RecorderState::Recording)));
+        assert_eq!(locked["text"], "recording");
+        assert_eq!(locked["tooltip"], "recording, vault locked");
         let setup = waybar(&status(VaultState::Uninitialized, None));
         assert_eq!(setup["text"], "uninitialized");
         assert!(

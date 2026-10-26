@@ -1,9 +1,9 @@
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use capricorn_core::Secret;
 use capricorn_core::proto::{
-    ClientReq, ClientResp, DeleteScope, Hit, RecordDetail, RecordRef, Status, VaultState,
+    ClientReq, ClientResp, DeleteScope, Hit, RecordDetail, RecordRef, Status, Ts, VaultState,
 };
 use iced::futures::SinkExt;
 use iced::widget::{image, operation};
@@ -25,7 +25,6 @@ use crate::unlock::{Gate, PASSWORD_INPUT};
 use crate::{reopen, style};
 
 const DEBOUNCE: Duration = Duration::from_millis(60);
-const STATUS_EVERY_TICKS: u32 = 20;
 
 static CONTROL_LISTENER: Mutex<Option<std::os::unix::net::UnixListener>> = Mutex::new(None);
 
@@ -96,8 +95,8 @@ pub struct App {
     timeline: TimelineState,
     search_surface: Option<(Id, u32)>,
     timeline_surface: Option<Id>,
-    locks_at: Option<Instant>,
-    ticks: u32,
+    /// Wall-clock milliseconds, so a suspend in between still counts down.
+    locks_at: Option<Ts>,
 }
 
 impl App {
@@ -112,7 +111,6 @@ impl App {
             search_surface: None,
             timeline_surface: None,
             locks_at: None,
-            ticks: 0,
         };
         app.search.set_gate(Some(Gate::Connecting));
         let task = app.request(ClientReq::Status, Message::Status);
@@ -384,17 +382,13 @@ impl App {
         Task::none()
     }
 
+    /// Runs only while a surface is shown. Asking every tick is how the UI learns that
+    /// the daemon locked, since the daemon never speaks unasked.
     fn tick(&mut self) -> Task<Message> {
-        let remaining = self
-            .locks_at
-            .map(|at| at.saturating_duration_since(Instant::now()).as_secs());
+        let remaining = self.locks_at.map(|at| secs_until(at, self.clock.now));
         self.search.set_locks_in(remaining);
         self.timeline.set_locks_in(remaining);
-        self.ticks = self.ticks.wrapping_add(1);
-        if self.ticks.is_multiple_of(STATUS_EVERY_TICKS) || remaining == Some(0) {
-            return self.request(ClientReq::Status, Message::Status);
-        }
-        Task::none()
+        self.request(ClientReq::Status, Message::Status)
     }
 
     fn status(&mut self, response: Response) -> Task<Message> {
@@ -405,19 +399,33 @@ impl App {
                 return self.fit_search();
             }
         };
-        let ClientResp::Status(Status { vault, .. }) = reply.resp else {
+        let ClientResp::Status(Status { vault, session, .. }) = reply.resp else {
             return Task::none();
         };
+        let was_locked = self.locked_views();
         match vault {
             VaultState::Uninitialized => self.lock_ui(Gate::Uninitialized),
-            VaultState::Unlocked { locks_in_secs } if self.session.accepts(&reply) => {
-                self.locks_at = Some(Instant::now() + Duration::from_secs(locks_in_secs));
+            VaultState::Unlocked { locks_in_secs } if session && self.session.accepts(&reply) => {
+                let locks_in_ms =
+                    Ts::try_from(locks_in_secs.saturating_mul(1000)).unwrap_or(Ts::MAX);
+                self.locks_at = Some(self.clock.now.saturating_add(locks_in_ms));
                 self.search.set_locks_in(Some(locks_in_secs));
                 self.timeline.set_locks_in(Some(locks_in_secs));
             }
             _ => self.lock_ui(Gate::Locked),
         }
-        Task::batch([self.fit_search(), self.refocus()])
+        // Refocusing moves the cursor to the end of the field, so only when the view
+        // switched; status arrives every second while a surface is shown.
+        let refocus = if self.locked_views() == was_locked {
+            Task::none()
+        } else {
+            self.refocus()
+        };
+        Task::batch([self.fit_search(), refocus])
+    }
+
+    fn locked_views(&self) -> (bool, bool) {
+        (self.search.is_locked(), self.timeline.is_locked())
     }
 
     fn lock_ui(&mut self, gate: Gate) {
@@ -576,6 +584,10 @@ impl App {
     }
 }
 
+fn secs_until(at: Ts, now: Ts) -> u64 {
+    u64::try_from(at.saturating_sub(now).max(0) / 1000).unwrap_or(0)
+}
+
 fn reopen_task(detail: RecordDetail) -> Task<Message> {
     Task::perform(reopen::reopen(detail), Message::Reopened)
 }
@@ -633,4 +645,73 @@ fn control_commands() -> impl iced::futures::Stream<Item = ControlCmd> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures;
+
+    fn status_reply(session: u64, vault: VaultState, holds_session: bool) -> Response {
+        Ok(Reply {
+            session,
+            resp: ClientResp::Status(Status {
+                vault,
+                recorder: None,
+                pending_index: 0,
+                session: holds_session,
+            }),
+        })
+    }
+
+    const UNLOCKED: VaultState = VaultState::Unlocked { locks_in_secs: 600 };
+
+    /// An app this UI unlocked on connection 1, with a search hit and a timeline day
+    /// on screen.
+    fn unlocked_app() -> App {
+        let client = DaemonClient::new("/nonexistent/client.sock".into());
+        let (mut app, _) = App::boot(client, Vec::new());
+        app.clock = fixtures::clock();
+        app.session.unlocked_on(1);
+        app.search.set_gate(None);
+        app.search.set_hits(fixtures::hits());
+        app.timeline.set_gate(None);
+        let _ = app.timeline.show_day(app.clock.today(), None, &app.clock);
+        let _ = app.timeline.set_entries(fixtures::day_entries());
+        let _ = app.status(status_reply(1, UNLOCKED, true));
+        assert!(app.search.selected_hit().is_some());
+        assert!(app.timeline.selected().is_some());
+        app
+    }
+
+    fn assert_cleared(app: &App) {
+        assert!(!app.session.is_unlocked());
+        assert!(app.search.is_locked() && app.timeline.is_locked());
+        assert!(app.search.selected_hit().is_none());
+        assert!(app.timeline.selected().is_none());
+        assert_eq!(app.locks_at, None);
+    }
+
+    #[test]
+    fn unlocked_vault_without_this_connections_session_clears_the_ui() {
+        let mut app = unlocked_app();
+        let _ = app.status(status_reply(1, UNLOCKED, false));
+        assert_cleared(&app);
+    }
+
+    #[test]
+    fn locked_vault_clears_the_ui() {
+        let mut app = unlocked_app();
+        let _ = app.status(status_reply(1, VaultState::Locked, false));
+        assert_cleared(&app);
+    }
+
+    #[test]
+    fn countdown_follows_the_wall_clock() {
+        let mut app = unlocked_app();
+        assert_eq!(app.locks_at, Some(app.clock.now + 600_000));
+        app.clock.now += 3_600_000;
+        assert_eq!(secs_until(app.locks_at.unwrap(), app.clock.now), 0);
+        assert_eq!(secs_until(10_500, 1_000), 9);
+    }
 }

@@ -26,11 +26,20 @@ const BROWSER_CLASSES: &[&str] = &[
     "zen",
 ];
 
+/// The host must start with a letter or digit, so a word like `-foo.com` never becomes
+/// a URL that a browser could read as an option.
 static URL_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(https?://)?[\w.-]+\.[a-z]{2,}(/\S*)?$").expect("url pattern compiles")
+    Regex::new(r"(?i)^(https?://)?[a-z0-9][\w.-]*\.[a-z]{2,}(/\S*)?$")
+        .expect("url pattern compiles")
 });
+static HAS_SCHEME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^https?://").expect("scheme pattern compiles"));
 
-/// First URL-looking word in the top band of a browser window, as shown in its address bar.
+/// First URL-looking word in the top band of a browser window, as shown in its address
+/// bar, with `https://` added when the bar hid the scheme.
+///
+/// Frames cover the whole output and carry no window geometry, so the band is the top
+/// of the output rather than of the browser window.
 pub fn guess_url(class: &str, words: &[Word], image_height: u32) -> Option<String> {
     if !BROWSER_CLASSES
         .iter()
@@ -43,7 +52,15 @@ pub fn guess_url(class: &str, words: &[Word], image_height: u32) -> Option<Strin
         .iter()
         .filter(|word| f64::from(word.rect.y) + f64::from(word.rect.h) / 2.0 < band)
         .find(|word| URL_TOKEN.is_match(&word.text))
-        .map(|word| word.text.clone())
+        .map(|word| with_scheme(&word.text))
+}
+
+fn with_scheme(url: &str) -> String {
+    if HAS_SCHEME.is_match(url) {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
+    }
 }
 
 pub struct Pipeline {
@@ -322,8 +339,30 @@ mod tests {
         ];
         assert_eq!(
             guess_url("firefox", &words, 1000).as_deref(),
-            Some("github.com/Garulf/capricorn")
+            Some("https://github.com/Garulf/capricorn")
         );
+    }
+
+    #[test]
+    fn url_guess_keeps_a_shown_scheme() {
+        let words = vec![word("http://192.168.1.1.example.lan/admin", 100, 40, 300)];
+        assert_eq!(
+            guess_url("firefox", &words, 1000).as_deref(),
+            Some("http://192.168.1.1.example.lan/admin")
+        );
+    }
+
+    #[test]
+    fn url_guess_rejects_words_that_look_like_options() {
+        for text in [
+            "-evil.com",
+            "--new-tab=x.org",
+            "https://-evil.com",
+            ".hidden.org",
+        ] {
+            let words = vec![word(text, 100, 40, 300)];
+            assert_eq!(guess_url("firefox", &words, 1000), None, "{text}");
+        }
     }
 
     #[test]

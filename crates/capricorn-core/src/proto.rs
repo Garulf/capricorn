@@ -199,6 +199,9 @@ pub struct Status {
     pub vault: VaultState,
     pub recorder: Option<RecorderState>,
     pub pending_index: u64,
+    /// Whether the connection that asked holds a session. `vault` describes the vault
+    /// as a whole, which another connection may have unlocked.
+    pub session: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -218,6 +221,7 @@ pub enum ClientReq {
     Pause,
     Resume,
     Touch,
+    TogglePause,
 }
 
 #[allow(clippy::large_enum_variant)]

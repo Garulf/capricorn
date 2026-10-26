@@ -70,6 +70,8 @@ pub enum Command {
     Pause,
     /// Resume recording.
     Resume,
+    /// Pause recording, or resume it when paused.
+    Toggle,
     /// Change the vault password. With --password-stdin, reads the old then the new password.
     Passwd {
         #[command(flatten)]

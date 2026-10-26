@@ -28,8 +28,6 @@ pub struct Config {
     pub allowed_uids: Vec<u32>,
     /// Lets an empty `allowed_uids` admit every uid; for development and tests only.
     pub allow_any_uid: bool,
-    pub capture_clients: Vec<PathBuf>,
-    pub ui_clients: Vec<PathBuf>,
     pub secret_patterns: Vec<String>,
     pub kdf: Option<KdfOverride>,
     /// Overrides `paths::data_dir()` when set.
@@ -48,8 +46,6 @@ impl Default for Config {
             forget_grace_mins: 15,
             allowed_uids: Vec::new(),
             allow_any_uid: false,
-            capture_clients: Vec::new(),
-            ui_clients: Vec::new(),
             secret_patterns: Vec::new(),
             kdf: None,
             data_dir: None,

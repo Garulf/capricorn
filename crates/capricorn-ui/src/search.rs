@@ -84,6 +84,11 @@ impl SearchState {
         if gate.is_some() {
             self.hits.clear();
             self.thumbs.clear();
+            self.app_chips.clear();
+            if matches!(self.filter, Filter::App(_)) {
+                self.filter = Filter::All;
+            }
+            self.selected = 0;
             self.locks_in_secs = None;
         }
         self.gate = gate;
