@@ -140,3 +140,52 @@ async fn events_stream_parses_lines_until_close() {
         ]
     );
 }
+
+fn serve_replies(
+    listener: UnixListener,
+    replies: Vec<&'static str>,
+) -> tokio::task::JoinHandle<Vec<String>> {
+    tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for reply in replies {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let read = conn.read(&mut buf).await.unwrap();
+            conn.write_all(reply.as_bytes()).await.unwrap();
+            requests.push(String::from_utf8_lossy(&buf[..read]).into_owned());
+        }
+        requests
+    })
+}
+
+fn kitty_plan() -> capricorn_hypr::ReopenPlan {
+    capricorn_hypr::ReopenPlan {
+        lua: r#"hl.dsp.exec_cmd("kitty", { workspace = "3" })"#.into(),
+        legacy: "[workspace 3] kitty".into(),
+    }
+}
+
+#[tokio::test]
+async fn reopen_uses_lua_dispatch_when_accepted() {
+    let runtime = tempfile::tempdir().unwrap();
+    let server = serve_replies(bind(runtime.path(), ".socket.sock"), vec!["ok"]);
+    hypr(&runtime).reopen(&kitty_plan()).await.unwrap();
+    assert_eq!(
+        server.await.unwrap(),
+        vec![r#"dispatch hl.dsp.exec_cmd("kitty", { workspace = "3" })"#]
+    );
+}
+
+#[tokio::test]
+async fn reopen_falls_back_to_hyprlang_exec() {
+    let runtime = tempfile::tempdir().unwrap();
+    let server = serve_replies(
+        bind(runtime.path(), ".socket.sock"),
+        vec!["Invalid dispatcher", "ok"],
+    );
+    hypr(&runtime).reopen(&kitty_plan()).await.unwrap();
+    assert_eq!(
+        server.await.unwrap()[1],
+        "dispatch exec [workspace 3] kitty"
+    );
+}

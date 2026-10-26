@@ -16,13 +16,61 @@ pub struct ReopenSpec {
 /// class falls back to the Exec line of a matching `.desktop` file, searched
 /// in `desktop_dirs` order.
 pub fn reopen_command(spec: &ReopenSpec, desktop_dirs: &[PathBuf]) -> Option<String> {
+    let command = launch_command(spec, desktop_dirs)?;
+    with_workspace_rule(&spec.workspace, &command)
+}
+
+/// Both dispatch forms for one reopen: Hyprland 0.55+ with a Lua config only
+/// accepts `lua`, a hyprlang config only accepts `legacy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReopenPlan {
+    /// Argument of `dispatch`, e.g. `hl.dsp.exec_cmd("kitty", { workspace = "3" })`.
+    pub lua: String,
+    /// Argument of `dispatch exec`, e.g. `[workspace 3] kitty`.
+    pub legacy: String,
+}
+
+pub fn reopen_plan(spec: &ReopenSpec, desktop_dirs: &[PathBuf]) -> Option<ReopenPlan> {
+    let command = launch_command(spec, desktop_dirs)?;
+    let legacy = with_workspace_rule(&spec.workspace, &command)?;
+    let lua = if spec.workspace.is_empty() {
+        format!("hl.dsp.exec_cmd({})", lua_string(&command))
+    } else {
+        format!(
+            "hl.dsp.exec_cmd({}, {{ workspace = {} }})",
+            lua_string(&command),
+            lua_string(&spec.workspace)
+        )
+    };
+    Some(ReopenPlan { lua, legacy })
+}
+
+fn launch_command(spec: &ReopenSpec, desktop_dirs: &[PathBuf]) -> Option<String> {
     let class = spec.class.trim();
     if class.is_empty() {
         return None;
     }
-    let command =
-        known_app_command(class, spec).or_else(|| desktop_file_exec(class, desktop_dirs))?;
-    with_workspace_rule(&spec.workspace, &command)
+    known_app_command(class, spec).or_else(|| desktop_file_exec(class, desktop_dirs))
+}
+
+fn lua_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => {
+                let mut buf = [0u8; 4];
+                for byte in c.encode_utf8(&mut buf).bytes() {
+                    out.push_str(&format!("\\{byte:03}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn with_workspace_rule(workspace: &str, command: &str) -> Option<String> {
@@ -260,6 +308,34 @@ mod tests {
 
     fn reopen(spec: &ReopenSpec) -> Option<String> {
         reopen_command(spec, &[])
+    }
+
+    #[test]
+    fn reopen_plan_has_lua_and_legacy_forms() {
+        let plan = reopen_plan(&spec("kitty", Some("/home/u/my proj"), None), &[]).unwrap();
+        assert_eq!(
+            plan.lua,
+            r#"hl.dsp.exec_cmd("kitty --directory '/home/u/my proj'", { workspace = "3" })"#
+        );
+        assert_eq!(
+            plan.legacy,
+            "[workspace 3] kitty --directory '/home/u/my proj'"
+        );
+    }
+
+    #[test]
+    fn reopen_plan_without_workspace_has_no_rule_table() {
+        let mut s = spec("kitty", None, None);
+        s.workspace.clear();
+        assert_eq!(
+            reopen_plan(&s, &[]).unwrap().lua,
+            r#"hl.dsp.exec_cmd("kitty")"#
+        );
+    }
+
+    #[test]
+    fn lua_string_escapes_quotes_backslashes_and_controls() {
+        assert_eq!(lua_string("a\"b\\c\nd"), r#""a\"b\\c\010d""#);
     }
 
     #[test]

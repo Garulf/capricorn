@@ -51,6 +51,22 @@ impl Hypr {
         }
     }
 
+    /// Tries the Lua dispatch first and falls back to the hyprlang form when
+    /// Hyprland reports the Lua call as an unknown dispatcher.
+    pub async fn reopen(&self, plan: &crate::ReopenPlan) -> Result<()> {
+        let reply = self.request(&format!("dispatch {}", plan.lua)).await?;
+        let reply = reply.trim();
+        if reply.starts_with("ok") {
+            return Ok(());
+        }
+        if reply.to_ascii_lowercase().contains("invalid dispatcher") {
+            return self
+                .dispatch(&format!("dispatch exec {}", plan.legacy))
+                .await;
+        }
+        Err(Error::Rejected(reply.to_owned()))
+    }
+
     /// Returns the focused window, or `None` when nothing is focused.
     pub async fn active_window(&self) -> Result<Option<crate::Client>> {
         let client: crate::Client = self.query("j/activewindow").await?;
