@@ -12,6 +12,7 @@ use clap::Parser;
 
 use crate::cli::Cli;
 use crate::error::EXIT_FAILURE;
+use crate::render::printable;
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -34,7 +35,7 @@ fn main() -> ExitCode {
     match runtime.block_on(commands::run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("capricorn: {err}");
+            eprintln!("capricorn: {}", printable(&err.to_string()));
             ExitCode::from(err.exit_code())
         }
     }

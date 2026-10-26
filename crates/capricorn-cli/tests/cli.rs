@@ -504,6 +504,44 @@ async fn reopen_unknown_app_without_desktop_file_fails() {
 }
 
 #[tokio::test]
+async fn reopen_error_does_not_echo_terminal_escapes_from_the_record() {
+    let env = Env::new();
+    env.start_daemon(accepting_daemon("pw", |_| {
+        detail("evil\u{1b}]0;owned\u{7}", None)
+    }));
+    let mut cmd = env.command(&["reopen", "1:2", "--password-stdin"]);
+    cmd.env("HYPRLAND_INSTANCE_SIGNATURE", "sig_1_2")
+        .env("XDG_DATA_DIRS", env.xdg.path());
+
+    let out = run_with_stdin(cmd, "pw\n").await;
+
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(
+        err.contains("evil") && !err.contains(['\u{1b}', '\u{7}']),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn reopen_error_does_not_echo_terminal_escapes_from_hyprland() {
+    let env = Env::new();
+    env.start_daemon(accepting_daemon("pw", |req| match req {
+        ClientReq::Detail(_) => detail("kitty", None),
+        _ => ClientResp::Err("unexpected".into()),
+    }));
+    let _hypr = serve_hypr(env.xdg.path(), "bad\u{1b}[2Jcommand").await;
+    let mut cmd = env.command(&["reopen", "1:2", "--password-stdin"]);
+    cmd.env("HYPRLAND_INSTANCE_SIGNATURE", "sig_1_2");
+
+    let out = run_with_stdin(cmd, "pw\n").await;
+
+    assert_eq!(out.status.code(), Some(1));
+    let err = stderr(&out);
+    assert!(err.contains("bad") && !err.contains('\u{1b}'), "{err:?}");
+}
+
+#[tokio::test]
 async fn reopen_rejects_malformed_ref() {
     let env = Env::new();
     let out = env.run(&["reopen", "nonsense"], "").await;
