@@ -1,8 +1,9 @@
 use capricorn_core::proto::WindowContext;
+use capricorn_core::rules::RuleSet;
 use capricorn_hypr::{Client, Monitor};
 use regex::Regex;
 
-use crate::exclude::Snapshot;
+use crate::exclude::{Snapshot, is_excluded};
 
 const TERMINAL_CLASSES: &[&str] = &[
     "kitty",
@@ -23,15 +24,19 @@ pub fn is_terminal(class: &str) -> bool {
 }
 
 /// Context for a frame of `mon`: the focused window when it is on `mon`, otherwise the
-/// largest visible window there. `cwd` is left for the caller to fill.
-pub fn window_context(snap: &Snapshot, mon: &Monitor) -> WindowContext {
-    let focused_here = snap.active.clone().filter(|c| c.monitor == mon.id);
-    let shown = focused_here.or_else(|| {
-        snap.visible_clients()
+/// largest visible window there. Excluded windows are never named: an excluded focused
+/// window gives an empty context, and excluded windows are skipped when picking the
+/// largest. `cwd` is left for the caller to fill.
+pub fn window_context(snap: &Snapshot, mon: &Monitor, rules: &RuleSet) -> WindowContext {
+    let shown = match snap.active.clone().filter(|c| c.monitor == mon.id) {
+        Some(focused) if is_excluded(&focused, rules) => None,
+        Some(focused) => Some(focused),
+        None => snap
+            .visible_clients()
             .into_iter()
-            .filter(|c| c.monitor == mon.id)
-            .max_by_key(area)
-    });
+            .filter(|c| c.monitor == mon.id && !is_excluded(c, rules))
+            .max_by_key(area),
+    };
     match shown {
         Some(client) => client_context(&client, &mon.name),
         None => empty_context(mon),
@@ -39,9 +44,10 @@ pub fn window_context(snap: &Snapshot, mon: &Monitor) -> WindowContext {
 }
 
 /// Context for something that happened in the focused window, such as a clipboard copy.
-pub fn focused_context(snap: &Snapshot) -> WindowContext {
+/// An excluded focused window is not named.
+pub fn focused_context(snap: &Snapshot, rules: &RuleSet) -> WindowContext {
     let monitor_of = |id: i32| snap.monitors.iter().find(|m| m.id == id);
-    match &snap.active {
+    match snap.active.as_ref().filter(|c| !is_excluded(c, rules)) {
         Some(client) => {
             let output = monitor_of(client.monitor).map_or("", |m| m.name.as_str());
             client_context(client, output)
@@ -161,7 +167,7 @@ mod tests {
     #[test]
     fn context_uses_active_window_on_its_monitor() {
         let snap = two_monitors();
-        let ctx = window_context(&snap, &snap.monitors[0]);
+        let ctx = window_context(&snap, &snap.monitors[0], &RuleSet::defaults());
         assert_eq!(ctx.class, "kitty");
         assert_eq!(ctx.title, "kitty title");
         assert_eq!(ctx.workspace, "1");
@@ -173,7 +179,7 @@ mod tests {
     #[test]
     fn context_on_other_monitor_uses_largest_visible_window() {
         let snap = two_monitors();
-        let ctx = window_context(&snap, &snap.monitors[1]);
+        let ctx = window_context(&snap, &snap.monitors[1], &RuleSet::defaults());
         assert_eq!(ctx.class, "slack");
         assert_eq!(ctx.workspace, "2");
         assert_eq!(ctx.output, "HDMI-A-1");
@@ -185,7 +191,7 @@ mod tests {
             monitors: vec![monitor(0, "DP-1", 3, true)],
             ..Snapshot::default()
         };
-        let ctx = window_context(&snap, &snap.monitors[0]);
+        let ctx = window_context(&snap, &snap.monitors[0], &RuleSet::defaults());
         assert_eq!(ctx.class, "");
         assert_eq!(ctx.workspace, "3");
         assert_eq!(ctx.output, "DP-1");
@@ -196,9 +202,46 @@ mod tests {
     fn focused_context_follows_active_window() {
         let mut snap = two_monitors();
         snap.active = Some(snap.clients[1].clone());
-        let ctx = focused_context(&snap);
+        let ctx = focused_context(&snap, &RuleSet::defaults());
         assert_eq!(ctx.class, "firefox");
         assert_eq!(ctx.output, "HDMI-A-1");
+    }
+
+    #[test]
+    fn context_never_names_an_excluded_focused_window() {
+        let mut snap = two_monitors();
+        let vault = client("0x8", "org.keepassxc.KeePassXC", 0, 1, [90, 90]);
+        snap.clients.push(vault.clone());
+        snap.active = Some(vault);
+        let rules = RuleSet::defaults();
+        let ctx = window_context(&snap, &snap.monitors[0], &rules);
+        assert_eq!(ctx.class, "");
+        assert_eq!(ctx.title, "");
+        assert_eq!(ctx.pid, None);
+        assert_eq!(ctx.workspace, "1");
+        assert_eq!(ctx.output, "DP-1");
+        let ctx = focused_context(&snap, &rules);
+        assert_eq!(ctx.class, "");
+        assert_eq!(ctx.title, "");
+        assert_eq!(ctx.pid, None);
+    }
+
+    #[test]
+    fn context_skips_excluded_windows_when_picking_the_largest() {
+        let mut snap = two_monitors();
+        snap.clients.push(Client {
+            title: "Mozilla Firefox Private Browsing".into(),
+            ..client("0x8", "firefox", 1, 2, [100, 100])
+        });
+        let rules = RuleSet::defaults();
+        let ctx = window_context(&snap, &snap.monitors[1], &rules);
+        assert_eq!(ctx.class, "slack");
+
+        snap.clients
+            .retain(|c| c.monitor == 1 && c.title.contains("Private"));
+        let ctx = window_context(&snap, &snap.monitors[1], &rules);
+        assert_eq!(ctx.class, "");
+        assert_eq!(ctx.title, "");
     }
 
     #[test]

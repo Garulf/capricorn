@@ -1,6 +1,12 @@
+use std::time::{Duration, Instant};
+
 use capricorn_core::rules::RuleSet;
 use capricorn_hypr::{Client, Monitor};
 use image::RgbaImage;
+
+/// How long frames stay unsafe after an excluded window left the place it was shown in.
+/// Covers fade-out and slide animations Hyprland no longer reports.
+pub const EXCLUDED_GRACE: Duration = Duration::from_secs(2);
 
 /// Hyprland state read just before or just after grabbing the outputs.
 #[derive(Debug, Clone, Default)]
@@ -37,6 +43,55 @@ impl Snapshot {
 
 pub fn is_excluded(client: &Client, rules: &RuleSet) -> bool {
     rules.matches(&client.class, &client.title, &client.workspace.name)
+}
+
+/// The focused window's popups, menus and tooltips can reach past its rectangle, so an
+/// excluded window with focus makes every frame unsafe.
+pub fn focus_is_excluded(snap: &Snapshot, rules: &RuleSet) -> bool {
+    focused_excluded(snap, rules).is_some()
+}
+
+/// Remembers where excluded windows were last shown. Once one closes, moves, or its
+/// workspace is switched away, Hyprland reports the end state while the old one is still
+/// being animated out, so frames are dropped for `EXCLUDED_GRACE` after that is noticed.
+#[derive(Debug, Default)]
+pub struct ExclusionMemory {
+    shown: Vec<ShownPlacement>,
+    left_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShownPlacement {
+    address: String,
+    at: [i32; 2],
+    size: [i32; 2],
+    workspace: i32,
+}
+
+impl ExclusionMemory {
+    pub fn observe(&mut self, snap: &Snapshot, rules: &RuleSet, now: Instant) {
+        let shown: Vec<_> = snap
+            .visible_clients()
+            .into_iter()
+            .filter(|c| is_excluded(c, rules))
+            .map(|c| ShownPlacement {
+                address: c.address,
+                at: c.at,
+                size: c.size,
+                workspace: c.workspace.id,
+            })
+            .collect();
+        if self.shown.iter().any(|old| !shown.contains(old)) {
+            self.left_at = Some(now);
+        }
+        self.shown = shown;
+    }
+
+    /// True while an excluded window may still be drawn where it no longer is.
+    pub fn unsettled(&self, now: Instant) -> bool {
+        self.left_at
+            .is_some_and(|at| now.saturating_duration_since(at) < EXCLUDED_GRACE)
+    }
 }
 
 fn is_drawn(client: &Client) -> bool {
@@ -415,6 +470,64 @@ mod tests {
             .map(|c| c.address)
             .collect();
         assert_eq!(addresses, ["0x1", "0x3"]);
+    }
+
+    #[test]
+    fn memory_is_unsettled_after_excluded_window_leaves() {
+        let rules = RuleSet::defaults();
+        let t = Instant::now();
+        let shown = snapshot(vec![keepass([0, 0], [10, 10])]);
+        let mut memory = ExclusionMemory::default();
+        memory.observe(&shown, &rules, t);
+        assert!(!memory.unsettled(t));
+
+        let mut switched = shown.clone();
+        switched.monitors[0].active_workspace = ws(2);
+        memory.observe(&switched, &rules, t + Duration::from_millis(100));
+        assert!(memory.unsettled(t + Duration::from_millis(100)));
+        assert!(memory.unsettled(t + Duration::from_millis(2099)));
+        assert!(!memory.unsettled(t + Duration::from_millis(2100)));
+    }
+
+    #[test]
+    fn memory_is_unsettled_after_excluded_window_closes_or_moves() {
+        let rules = RuleSet::defaults();
+        let t = Instant::now();
+        let mut memory = ExclusionMemory::default();
+        memory.observe(&snapshot(vec![keepass([0, 0], [10, 10])]), &rules, t);
+        memory.observe(&snapshot(vec![]), &rules, t);
+        assert!(memory.unsettled(t));
+
+        let later = t + EXCLUDED_GRACE * 2;
+        memory.observe(&snapshot(vec![keepass([0, 0], [10, 10])]), &rules, later);
+        assert!(!memory.unsettled(later));
+        memory.observe(&snapshot(vec![keepass([30, 0], [10, 10])]), &rules, later);
+        assert!(memory.unsettled(later));
+    }
+
+    #[test]
+    fn memory_ignores_other_windows_and_appearing_excluded_ones() {
+        let rules = RuleSet::defaults();
+        let t = Instant::now();
+        let mut memory = ExclusionMemory::default();
+        memory.observe(
+            &snapshot(vec![client("0x1", "kitty", [0, 0], [5, 5])]),
+            &rules,
+            t,
+        );
+        memory.observe(&snapshot(vec![keepass([0, 0], [10, 10])]), &rules, t);
+        assert!(!memory.unsettled(t));
+    }
+
+    #[test]
+    fn focused_excluded_window_is_detected() {
+        let rules = RuleSet::defaults();
+        let mut snap = snapshot(vec![keepass([0, 0], [10, 10])]);
+        assert!(!focus_is_excluded(&snap, &rules));
+        snap.active = Some(client("0x1", "kitty", [0, 0], [5, 5]));
+        assert!(!focus_is_excluded(&snap, &rules));
+        snap.active = Some(keepass([0, 0], [10, 10]));
+        assert!(focus_is_excluded(&snap, &rules));
     }
 
     #[test]

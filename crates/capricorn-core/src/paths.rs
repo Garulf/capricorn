@@ -32,6 +32,11 @@ pub fn capture_socket() -> PathBuf {
     runtime_dir().join("capture.sock")
 }
 
+/// `capture_socket` without the `CAPRICORN_RUNTIME_DIR` override.
+pub fn default_capture_socket() -> PathBuf {
+    PathBuf::from(DEFAULT_RUNTIME_DIR).join("capture.sock")
+}
+
 pub fn client_socket() -> PathBuf {
     runtime_dir().join("client.sock")
 }
@@ -44,6 +49,14 @@ mod tests {
     fn override_wins() {
         let got = resolve_value(Some("/tmp/x".into()), "/default");
         assert_eq!(got, PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn default_capture_socket_is_under_run() {
+        assert_eq!(
+            default_capture_socket(),
+            PathBuf::from("/run/capricorn/capture.sock")
+        );
     }
 
     #[test]

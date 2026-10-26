@@ -41,6 +41,8 @@ const SOURCE_TIMEOUT: Duration = Duration::from_secs(1);
 /// A text selection someone copied. No `Debug`: the text may be sensitive.
 pub struct ClipText {
     pub text: String,
+    /// When the new selection was announced, before its text was read.
+    pub seen_at: Instant,
 }
 
 /// Password managers mark their copies with a hint MIME whose payload is `secret`. A hint we
@@ -96,6 +98,7 @@ pub fn watch(conn: Connection, tx: UnboundedSender<ClipText>) -> anyhow::Result<
         let Some(offer) = state.selection.take() else {
             continue;
         };
+        let seen_at = Instant::now();
         let mimes = state.mimes.remove(&offer.id()).unwrap_or_default();
         let text = read_text(&conn, &offer, &mimes);
         offer.destroy();
@@ -103,7 +106,7 @@ pub fn watch(conn: Connection, tx: UnboundedSender<ClipText>) -> anyhow::Result<
             let hash = text_hash(&text);
             if last_hash != Some(hash) {
                 last_hash = Some(hash);
-                let _ = tx.send(ClipText { text });
+                let _ = tx.send(ClipText { text, seen_at });
             }
         }
     }

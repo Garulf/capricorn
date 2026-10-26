@@ -2,7 +2,6 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use capricorn_core::framing::write_msg;
-use capricorn_core::paths::capture_socket;
 use capricorn_core::proto::{CaptureMsg, ClipboardEntry, Frame, Ts, WindowContext};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -29,7 +28,7 @@ pub struct InjectArgs {
 
 pub async fn run(args: InjectArgs) -> anyhow::Result<()> {
     let msg = message(&args, crate::recorder::now_ms())?;
-    let socket = capture_socket();
+    let socket = crate::daemon_socket();
     let mut stream = UnixStream::connect(&socket)
         .await
         .with_context(|| format!("connecting to {}", socket.display()))?;
