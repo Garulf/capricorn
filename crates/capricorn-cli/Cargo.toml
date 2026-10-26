@@ -11,3 +11,14 @@ name = "capricorn"
 path = "src/main.rs"
 
 [dependencies]
+capricorn-core.workspace = true
+capricorn-hypr.workspace = true
+clap.workspace = true
+rpassword = "7"
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
