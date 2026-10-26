@@ -7,3 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+capricorn-core.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "webp"] }
+ocrs = "0.13"
+regex.workspace = true
+rten = "0.26"
+webp = { version = "0.3", default-features = false }
+
+[dev-dependencies]
