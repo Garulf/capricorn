@@ -108,6 +108,15 @@ impl Index {
         self.delete_term(Term::from_field_u64(self.fields.record_ref, r.to_u64()))
     }
 
+    /// One commit for the whole batch.
+    pub fn delete_refs(&mut self, refs: &[RecordRef]) -> Result<()> {
+        for r in refs {
+            self.writer
+                .delete_term(Term::from_field_u64(self.fields.record_ref, r.to_u64()));
+        }
+        self.commit()
+    }
+
     pub fn delete_hour(&mut self, hour: u32) -> Result<()> {
         self.delete_term(Term::from_field_u64(self.fields.hour, u64::from(hour)))
     }

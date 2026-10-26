@@ -20,7 +20,10 @@ pub struct Config {
     pub retention_max_gib: Option<u64>,
     pub clipboard_retention_days: Option<u32>,
     pub forget_grace_mins: u32,
+    /// Uids allowed on the daemon sockets. Empty is refused unless `allow_any_uid`.
     pub allowed_uids: Vec<u32>,
+    /// Lets an empty `allowed_uids` admit every uid; for development and tests only.
+    pub allow_any_uid: bool,
     pub capture_clients: Vec<PathBuf>,
     pub ui_clients: Vec<PathBuf>,
     pub secret_patterns: Vec<String>,
@@ -40,6 +43,7 @@ impl Default for Config {
             clipboard_retention_days: None,
             forget_grace_mins: 15,
             allowed_uids: Vec::new(),
+            allow_any_uid: false,
             capture_clients: Vec::new(),
             ui_clients: Vec::new(),
             secret_patterns: Vec::new(),
@@ -93,6 +97,7 @@ mod tests {
         assert_eq!(cfg.forget_grace_mins, 15);
         assert!(cfg.kdf.is_none());
         assert!(cfg.data_dir.is_none() && cfg.runtime_dir.is_none());
+        assert!(cfg.allowed_uids.is_empty() && !cfg.allow_any_uid);
     }
 
     #[test]

@@ -26,6 +26,11 @@ pub fn redact(img: &mut RgbImage, words: &[Word], extra: &[Regex]) -> String {
 
 /// Words joined by a space, or a newline when the next word starts a new visual line.
 /// Returns the text and each word's byte span in it.
+/// `text` with every secret span replaced by `[redacted]`.
+pub fn redact_text(text: &str, extra: &[Regex]) -> String {
+    replace_ranges(text, &find_secrets(text, extra))
+}
+
 fn join_words(words: &[Word]) -> (String, Vec<Range<usize>>) {
     let mut text = String::new();
     let mut spans = Vec::with_capacity(words.len());

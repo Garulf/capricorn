@@ -7,19 +7,19 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use capricorn_core::config::Config;
-use capricorn_core::framing::{read_msg, write_msg};
+use capricorn_core::framing::{read_msg, read_msg_limited, write_msg};
 use capricorn_core::proto::{CaptureCtl, CaptureMsg, ClientReq, ClientResp};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::capture::{CaptureQueue, RateLimit, Work};
 use crate::daemon::Daemon;
-use crate::logind::{LockSignals, Logind, NoLockSignals};
+use crate::logind::{LockRequest, LockSignals, Logind, NoLockSignals};
 use crate::ocr::{Ocr, OcrsEngine};
 use crate::peer::check_peer;
 use crate::pipeline::Pipeline;
@@ -34,6 +34,10 @@ const FAILED_AUTH_DELAY: Duration = Duration::from_secs(1);
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const FRAMES_PER_SEC: u32 = 2;
 const CLIPBOARDS_PER_SEC: u32 = 10;
+/// Per socket; further peers are turned away until one disconnects.
+const MAX_CONNECTIONS: usize = 64;
+/// Client requests are small; only capture frames need the full frame limit.
+const CLIENT_FRAME_LIMIT: u32 = 64 * 1024;
 
 /// The production entry point: OCR models from `CAPRICORN_OCR_MODELS`, lock signals
 /// from logind, and SIGTERM or Ctrl-C to stop.
@@ -63,6 +67,9 @@ pub async fn run_with_lock_signals(
     signals: impl LockSignals,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    if cfg.allowed_uids.is_empty() && !cfg.allow_any_uid {
+        bail!("allowed_uids is empty; list the users who may connect, or set allow_any_uid = true");
+    }
     let secret_patterns = cfg.compiled_secret_patterns()?;
     let runtime_dir = cfg.runtime_dir();
     std::fs::create_dir_all(&runtime_dir)
@@ -165,13 +172,19 @@ fn spawn_worker(
 
 async fn accept_captures(listener: UnixListener, daemon: Arc<Daemon>, queue: Arc<CaptureQueue>) {
     let mut connections = JoinSet::new();
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut last_capture = 0u64;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let Some(stream) = admit(accepted, &daemon, |cfg| &cfg.capture_clients).await else {
                     continue;
                 };
-                connections.spawn(serve_capture(stream, daemon.clone(), queue.clone()));
+                let Some(slot) = take_slot(&slots) else {
+                    continue;
+                };
+                last_capture += 1;
+                connections.spawn(serve_capture(stream, daemon.clone(), queue.clone(), last_capture, slot));
             }
             Some(_) = connections.join_next() => {}
         }
@@ -180,6 +193,7 @@ async fn accept_captures(listener: UnixListener, daemon: Arc<Daemon>, queue: Arc
 
 async fn accept_clients(listener: UnixListener, daemon: Arc<Daemon>) {
     let mut connections = JoinSet::new();
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let mut last_conn: ConnId = 0;
     loop {
         tokio::select! {
@@ -187,12 +201,23 @@ async fn accept_clients(listener: UnixListener, daemon: Arc<Daemon>) {
                 let Some(stream) = admit(accepted, &daemon, |cfg| &cfg.ui_clients).await else {
                     continue;
                 };
+                let Some(slot) = take_slot(&slots) else {
+                    continue;
+                };
                 last_conn += 1;
-                connections.spawn(serve_client(stream, daemon.clone(), last_conn));
+                connections.spawn(serve_client(stream, daemon.clone(), last_conn, slot));
             }
             Some(_) = connections.join_next() => {}
         }
     }
+}
+
+fn take_slot(slots: &Arc<Semaphore>) -> Option<OwnedSemaphorePermit> {
+    let slot = slots.clone().try_acquire_owned().ok();
+    if slot.is_none() {
+        warn!(limit = MAX_CONNECTIONS, "too many connections; refused one");
+    }
+    slot
 }
 
 /// Peer checks fail closed: a peer whose identity cannot be read is refused.
@@ -219,9 +244,14 @@ async fn admit(
     }
 }
 
-async fn serve_client(mut stream: UnixStream, daemon: Arc<Daemon>, conn: ConnId) {
+async fn serve_client(
+    mut stream: UnixStream,
+    daemon: Arc<Daemon>,
+    conn: ConnId,
+    _slot: OwnedSemaphorePermit,
+) {
     loop {
-        let req: ClientReq = match read_msg(&mut stream).await {
+        let req: ClientReq = match read_msg_limited(&mut stream, CLIENT_FRAME_LIMIT).await {
             Ok(req) => req,
             Err(error) => {
                 if error.kind() != io::ErrorKind::UnexpectedEof {
@@ -249,7 +279,14 @@ async fn respond(daemon: &Arc<Daemon>, conn: ConnId, req: ClientReq) -> ClientRe
     reply.resp
 }
 
-async fn serve_capture(stream: UnixStream, daemon: Arc<Daemon>, queue: Arc<CaptureQueue>) {
+async fn serve_capture(
+    stream: UnixStream,
+    daemon: Arc<Daemon>,
+    queue: Arc<CaptureQueue>,
+    capture: u64,
+    _slot: OwnedSemaphorePermit,
+) {
+    daemon.capture_connected(capture);
     let (mut reader, writer) = stream.into_split();
     let forwarder = tokio::spawn(forward_ctl(
         writer,
@@ -283,11 +320,11 @@ async fn serve_capture(stream: UnixStream, daemon: Arc<Daemon>, queue: Arc<Captu
                 let forgetter = daemon.clone();
                 let _ = tokio::task::spawn_blocking(move || forgetter.forget(minutes)).await;
             }
-            CaptureMsg::Recorder(recorder) => daemon.set_recorder(Some(recorder)),
+            CaptureMsg::Recorder(recorder) => daemon.set_recorder(capture, recorder),
         }
     }
     forwarder.abort();
-    daemon.set_recorder(None);
+    daemon.capture_disconnected(capture);
 }
 
 async fn forward_ctl(
@@ -326,11 +363,14 @@ async fn ingest_when_asked(daemon: Arc<Daemon>) {
 async fn lock_on_signals(signals: impl LockSignals, daemon: Arc<Daemon>) {
     let (tx, mut rx) = mpsc::channel(8);
     let locker = async {
-        while let Some(cause) = rx.recv().await {
+        while let Some(LockRequest { cause, done }) = rx.recv().await {
             info!(?cause, "lock signal");
             let daemon = daemon.clone();
-            let _ =
+            let locked =
                 tokio::task::spawn_blocking(move || daemon.lock_vault("system lock signal")).await;
+            if locked.is_ok() {
+                let _ = done.send(());
+            }
         }
     };
     tokio::join!(signals.watch(tx), locker);

@@ -91,7 +91,8 @@ fn decrypt_snapshot(key: &IndexKey, sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>>
         .context("index snapshot is truncated")?;
     let plain_len = u64::from_be_bytes(prefix);
     let actual = sealed.len() as u64;
-    if plain_len > actual || sealed_len(plain_len) + LENGTH_PREFIX != actual {
+    let expected = sealed_len(plain_len).and_then(|len| len.checked_add(LENGTH_PREFIX));
+    if expected != Some(actual) {
         bail!("index snapshot has the wrong length");
     }
     let mut file = Cursor::new(sealed);
@@ -185,6 +186,10 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert!(files.load(&key).is_err());
         std::fs::write(&path, &bytes[..4]).unwrap();
+        assert!(files.load(&key).is_err());
+        let mut hostile = u64::MAX.to_be_bytes().to_vec();
+        hostile.extend_from_slice(&bytes[8..]);
+        std::fs::write(&path, &hostile).unwrap();
         assert!(files.load(&key).is_err());
     }
 }
