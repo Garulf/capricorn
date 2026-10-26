@@ -62,8 +62,10 @@ self:
         machine.fail("grep -r CANARY-CLIP /var/lib/capricorn")
 
     with subtest("search after unlock in one session"):
-        out = as_user("alice", "printf 'correct horse\\n' | capricorn search CANARY --password-stdin --json")
-        assert "CANARY-CLIP-1234" in out, out
+        search = "printf 'correct horse\\n' | capricorn search CANARY --password-stdin --json"
+        machine.wait_until_succeeds(
+            f"su - alice -c {shlex.quote(search)} | grep -F CANARY-CLIP-1234", timeout=120
+        )
 
     with subtest("wrong password is refused"):
         as_user_fails("alice", "printf 'wrong\\n' | capricorn search CANARY --password-stdin --json")

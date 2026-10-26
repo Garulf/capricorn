@@ -442,11 +442,17 @@ impl Daemon {
         let compacted = lock(&self.store)
             .as_mut()
             .context("vault has no segment store")?
-            .compact_orphans(&id);
+            .compact_orphans(&id, now_ms(), self.cfg.forget_grace_mins);
         match compacted {
-            Ok(hours) => {
-                for hour in hours {
+            Ok(report) => {
+                for hour in report.compacted {
                     watermark.sealed_hours.remove(&hour);
+                }
+                for (path, error) in report.quarantined {
+                    warn!(path = %path.display(), %error, "quarantined unreadable segment");
+                }
+                for (hour, error) in report.failed {
+                    warn!(hour, %error, "could not merge orphaned segments for hour");
                 }
             }
             Err(error) => warn!(%error, "could not merge orphaned segments"),
