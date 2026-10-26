@@ -16,7 +16,11 @@ pub struct KdfOverride {
 #[serde(default)]
 pub struct Config {
     pub lock_timeout_secs: u64,
+    /// `0` in the file means no age limit.
+    #[serde(with = "zero_is_unlimited")]
     pub retention_days: Option<u32>,
+    /// `0` in the file means no size limit.
+    #[serde(with = "zero_is_unlimited")]
     pub retention_max_gib: Option<u64>,
     pub clipboard_retention_days: Option<u32>,
     pub forget_grace_mins: u32,
@@ -74,6 +78,28 @@ impl Config {
     }
 }
 
+/// TOML has no null, so an unlimited retention bound is written as `0`.
+mod zero_is_unlimited {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<T, S>(value: &Option<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Copy + Default + Serialize,
+        S: Serializer,
+    {
+        value.unwrap_or_default().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<T>, D::Error>
+    where
+        T: Deserialize<'de> + Default + PartialEq,
+        D: Deserializer<'de>,
+    {
+        let value = T::deserialize(deserializer)?;
+        Ok((value != T::default()).then_some(value))
+    }
+}
+
 /// A missing file yields `Config::default()`; any other read or parse failure is an error.
 pub fn load(path: &Path) -> anyhow::Result<Config> {
     match std::fs::read_to_string(path) {
@@ -118,6 +144,15 @@ mod tests {
         assert_eq!(cfg.retention_days, Some(30));
         assert_eq!(cfg.retention_max_gib, Some(50));
         assert_eq!(cfg.kdf.unwrap().memory_kib, 8);
+    }
+
+    #[test]
+    fn zero_retention_means_unlimited() {
+        let cfg: Config = toml::from_str("retention_days = 0\nretention_max_gib = 0\n").unwrap();
+        assert_eq!(cfg.retention_days, None);
+        assert_eq!(cfg.retention_max_gib, None);
+        let round: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(round, cfg);
     }
 
     #[test]

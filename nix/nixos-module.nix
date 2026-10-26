@@ -22,8 +22,9 @@ let
 
   daemonSettings = lib.recursiveUpdate {
     lock_timeout_secs = cfg.lockTimeout;
-    retention_days = cfg.retention.days;
-    retention_max_gib = cfg.retention.maxGiB;
+    # The daemon reads 0 as unlimited; a missing key would mean its default.
+    retention_days = if cfg.retention.days == null then 0 else cfg.retention.days;
+    retention_max_gib = if cfg.retention.maxGiB == null then 0 else cfg.retention.maxGiB;
     clipboard_retention_days = cfg.retention.clipboardDays;
     # The daemon runs as its own uid and can't read other users'
     # /proc/<pid>/exe, so peers are checked by uid and socket group only.
