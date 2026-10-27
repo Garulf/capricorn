@@ -13,12 +13,12 @@
 let
   ocrModels = {
     detection = fetchurl {
-      url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.rten";
-      hash = "sha256-8Vz7Vr0CxL9HiiA0OYZQSh8B4WZcKzoK1mNA8FSxtco=";
+      url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx";
+      hash = "sha256-qReyPb2VJLRl336SJkGz/ymBYj303tWgI0AE7y/ufP4=";
     };
     recognition = fetchurl {
-      url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.rten";
-      hash = "sha256-5ISGbUzOQDF1vY0AsSj+sIq0LiCN4w5CzZiJ2PFzWm4=";
+      url = "https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx";
+      hash = "sha256-hsFFwu25bIyu1bHruPRNcGQIkiIRRRwwnGJRV91gYcU=";
     };
   };
   uiRuntimeLibs = [
@@ -53,8 +53,8 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   postInstall = ''
-    install -Dm444 ${ocrModels.detection} $out/share/capricorn/models/text-detection.rten
-    install -Dm444 ${ocrModels.recognition} $out/share/capricorn/models/text-recognition.rten
+    install -Dm444 ${ocrModels.detection} $out/share/capricorn/models/text-detection.onnx
+    install -Dm444 ${ocrModels.recognition} $out/share/capricorn/models/text-recognition.onnx
   '';
 
   # The UI dlopens Wayland, xkbcommon and GPU libraries. An rpath keeps the
