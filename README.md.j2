@@ -1,0 +1,162 @@
+{% extends "base.md.j2" %}
+
+{% block install %}
+## Installation
+
+Capricorn ships as a Nix flake with a NixOS module (the vault daemon) and a Home Manager
+module (screen capture, the search overlay and Hyprland integration). It needs Hyprland
+0.49 or newer for the screencopy permission system.
+
+```nix
+# flake.nix
+{
+  inputs.capricorn.url = "github:Garulf/capricorn";
+
+  outputs = { nixpkgs, home-manager, capricorn, ... }: {
+    nixosConfigurations.laptop = nixpkgs.lib.nixosSystem {
+      modules = [
+        capricorn.nixosModules.default
+        {
+          services.capricorn = {
+            enable = true;
+            users = [ "alice" ];      # each user needs an explicit uid
+          };
+        }
+        home-manager.nixosModules.home-manager
+        {
+          home-manager.users.alice = {
+            imports = [ capricorn.homeManagerModules.default ];
+            programs.capricorn.enable = true;
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+The NixOS module refuses to build on a host where captured data could reach disk in the
+clear: unencrypted swap, hibernation to an unencrypted device, or stored core dumps. See
+[docs/security.md](docs/security.md) for why, and `services.capricorn.allowInsecureHost`
+if you really need to override it.
+{% endblock %}
+
+{% block usage %}
+## Usage
+
+Create the vault once. The password is separate from your login password, and the
+recovery code is the only way back in if you forget it, so write it down and keep it
+offline.
+
+```sh
+capricorn init
+```
+
+Recording starts as soon as the capture service runs. It keeps going while the vault is
+locked: new captures are encrypted with the vault's public key and become searchable the
+next time you unlock.
+
+### Keybinds
+
+| Keys | Action |
+|---|---|
+| `SUPER + ALT + R` | Search overlay |
+| `SUPER + ALT + T` | Timeline |
+| `SUPER + ALT + L` | Lock the vault |
+| `SUPER + ALT + P` | Pause or resume recording |
+
+Change them with `programs.capricorn.keybinds.*`, or set one to `null` to drop it. The
+Home Manager module writes Lua when `wayland.windowManager.hyprland.configType = "lua"`
+and hyprlang otherwise.
+
+In the search overlay, Enter opens the moment in the timeline, Ctrl+C copies the matched
+text, Ctrl+O reopens the app on its old workspace (terminals in the same directory,
+browsers on the same page when it was captured) and Esc closes it.
+
+### Command line
+
+```sh
+capricorn status              # vault and recorder state
+capricorn search nix flake    # asks for the password, prints matches
+capricorn search --json --kind clipboard token
+capricorn forget 10           # drop the last 10 minutes
+capricorn toggle              # pause, or resume when paused
+capricorn lock
+capricorn passwd
+```
+
+### Locking
+
+The vault locks after 15 minutes without use (`services.capricorn.lockTimeout`), on
+suspend, and when logind locks your session. If you lock with hyprlock through hypridle,
+add Capricorn to the lock command:
+
+```nix
+services.hypridle.settings.general.lock_cmd = "capricorn lock; pidof hyprlock || hyprlock";
+```
+
+### Waybar
+
+```json
+"custom/capricorn": {
+  "exec": "capricorn status --waybar --follow",
+  "return-type": "json",
+  "on-click": "capricorn show search"
+}
+```
+
+The module shows the recorder, because recording goes on while the vault is locked. Its
+`class` is one of `recording`, `paused`, `idle`, `locked` (the screen is locked) or `off`
+(no daemon or no capture client). The tooltip says whether the vault is locked.
+
+### Keeping things out
+
+Password managers (KeePassXC, Bitwarden, 1Password and others) and private browser
+windows are never recorded. Add your own rules:
+
+```nix
+programs.capricorn.exclude = [
+  { class = "^signal$"; }
+  { title = "bank"; }
+  { workspace = "9"; }
+];
+```
+
+Clipboard entries marked as secret by password managers, and anything that looks like an
+API token, key or JWT, are never stored. The same patterns are blurred out of screenshots
+before they are saved.
+
+### Retention
+
+History is kept for 90 days or 50 GiB, whichever comes first. Both are configurable,
+including `null` for forever:
+
+```nix
+services.capricorn.retention = {
+  days = null;
+  maxGiB = 200;
+  clipboardDays = 7;
+};
+```
+{% endblock %}
+
+{% block extra %}
+## How it stays private
+
+- Nothing leaves the machine. The daemon runs as its own system user with no network
+  access.
+- History is encrypted at rest and readable only after you unlock with your password.
+  Programs running as you can't read the files, even while you are using your desktop.
+- Recording only needs the vault's public key, so whatever records can't read back what
+  it recorded.
+
+The full threat model, including what this does not protect against, is in
+[docs/security.md](docs/security.md).
+
+## Limitations
+
+- Hyprland only, Wayland only.
+- Password manager popups inside a browser window can't be excluded by window rules.
+- While the vault is unlocked and on screen, anything that can see your screen can see
+  your history.
+{% endblock %}

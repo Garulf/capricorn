@@ -1,0 +1,25 @@
+[package]
+name = "capricorn-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "capricorn"
+path = "src/main.rs"
+
+[dependencies]
+capricorn-core.workspace = true
+capricorn-hypr.workspace = true
+clap.workspace = true
+jiff = "0.2"
+rpassword = "7"
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
