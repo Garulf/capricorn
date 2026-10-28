@@ -29,8 +29,8 @@ impl OcrsEngine {
             Model::load_file(&path).with_context(|| format!("loading OCR model {}", path.display()))
         };
         let engine = OcrEngine::new(OcrEngineParams {
-            detection_model: Some(model("text-detection.rten")?),
-            recognition_model: Some(model("text-recognition.rten")?),
+            detection_model: Some(model("text-detection.onnx")?),
+            recognition_model: Some(model("text-recognition.onnx")?),
             ..Default::default()
         })?;
         Ok(Self { engine })
