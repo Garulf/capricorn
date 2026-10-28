@@ -57,10 +57,13 @@ rustPlatform.buildRustPackage {
     install -Dm444 ${ocrModels.recognition} $out/share/capricorn/models/text-recognition.onnx
   '';
 
-  # The UI dlopens Wayland, xkbcommon and GPU libraries. An rpath keeps the
-  # binary at its own store path instead of behind a wrapper script.
+  # The UI dlopens Wayland, xkbcommon and GPU libraries. Capture dlopens
+  # Wayland too: Cargo unifies features across the workspace build, so it gets
+  # winit's dlopen backend. An rpath keeps each binary at its own store path
+  # instead of behind a wrapper script.
   postFixup = ''
     patchelf --add-rpath ${lib.makeLibraryPath uiRuntimeLibs} $out/bin/capricorn-ui
+    patchelf --add-rpath ${lib.makeLibraryPath [ wayland ]} $out/bin/capricorn-capture
   '';
 
   passthru = { inherit ocrModels; };
